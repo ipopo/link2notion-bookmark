@@ -1,4 +1,9 @@
 // === 基础工具 ===
+const TWEET_ICONS = ['🌊','🌀','💡','🔥','⚡','🎯','🧠','🌿','🪐','🎲','🔮','🌸','🦋','🗺️','🧩','💎','🚀','🌈','🎪','🍀'];
+function randomTweetIcon() {
+    return TWEET_ICONS[Math.floor(Math.random() * TWEET_ICONS.length)];
+}
+
 function extractUUID(input) {
     if (!input) return null;
     const match = input.match(/([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
@@ -63,9 +68,9 @@ async function fetchRemoteMetadata(url) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(text, "text/html");
 
+        const tagTitle = doc.querySelector('title')?.textContent?.trim();
         const ogTitle = doc.querySelector('meta[property="og:title"]')?.content;
-        const tagTitle = doc.querySelector('title')?.innerText;
-        result.title = cleanTitle(url, ogTitle || tagTitle || url);
+        result.title = cleanTitle(url, tagTitle || ogTitle || url);
 
         const ogDesc = doc.querySelector('meta[property="og:description"]')?.content;
         const metaDesc = doc.querySelector('meta[name="description"]')?.content;
@@ -88,6 +93,215 @@ async function fetchRemoteMetadata(url) {
     return result;
 }
 
+// === X/Twitter 推文线程内容提取 ===
+async function extractXThread(tabId) {
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+            function getPlainText(el) {
+                return (el?.textContent || '').replace(/\s+/g, ' ').trim();
+            }
+
+            function extractRichText(el) {
+                const segments = [];
+                function walk(node, bold, italic) {
+                    if (node.nodeType === 3) {
+                        const t = node.textContent || '';
+                        if (!t) return;
+                        const anns = [];
+                        if (bold) anns.push(['b']);
+                        if (italic) anns.push(['i']);
+                        segments.push(anns.length ? [t, anns] : [t]);
+                    } else if (node.nodeName === 'BR') {
+                        segments.push(['\n']);
+                    } else if (node.nodeName === 'A') {
+                        const text = (node.textContent || '').trim();
+                        const href = node.href || '';
+                        if (!text) return;
+                        const anns = [];
+                        if (bold) anns.push(['b']);
+                        if (italic) anns.push(['i']);
+                        if (href.startsWith('http')) anns.push(['a', href]);
+                        segments.push(anns.length ? [text, anns] : [text]);
+                    } else if (node.nodeName === 'IMG') {
+                        const alt = node.getAttribute('alt') || '';
+                        if (alt) segments.push([alt]);
+                    } else if (node.nodeType === 1) {
+                        const isBold = bold || ['STRONG', 'B'].includes(node.nodeName) ||
+                            parseInt(getComputedStyle(node).fontWeight || '400') >= 700;
+                        const isItalic = italic || ['EM', 'I'].includes(node.nodeName) ||
+                            getComputedStyle(node).fontStyle === 'italic';
+                        for (const child of node.childNodes) walk(child, isBold, isItalic);
+                    }
+                }
+                for (const child of el.childNodes) walk(child, false, false);
+                return segments;
+            }
+
+            // 找包含所有 span[data-text="true"] 的最近祖先容器
+            function findTextContainer(article) {
+                const allSpans = article.querySelectorAll('span[data-text="true"]');
+                if (!allSpans.length) return null;
+                const total = allSpans.length;
+                let candidate = allSpans[0].parentElement;
+                while (candidate && candidate !== article) {
+                    if (candidate.querySelectorAll('span[data-text="true"]').length === total) return candidate;
+                    candidate = candidate.parentElement;
+                }
+                return allSpans[0].parentElement;
+            }
+
+            // 将一条推文解析为有序 blocks（text / image / video）
+            function extractTweetBlocks(article) {
+                const blocks = [];
+                const seenImgSrcs = new Set();
+
+                function addImage(img) {
+                    if (!img) return;
+                    let src = (img.src || '').replace(/([?&]name=)\w+/, '$1large');
+                    if (src.startsWith('http') && !seenImgSrcs.has(src)) {
+                        seenImgSrcs.add(src);
+                        blocks.push({ type: 'image', url: src });
+                    }
+                }
+                function addImagesFromEl(el) {
+                    if (el.getAttribute('data-testid') === 'tweetPhoto') {
+                        addImage(el.querySelector('img'));
+                    } else {
+                        el.querySelectorAll('[data-testid="tweetPhoto"] img').forEach(addImage);
+                    }
+                }
+
+                const textContainer = findTextContainer(article) ||
+                    article.querySelector('[data-testid="tweetText"]');
+
+                if (textContainer) {
+                    // 遍历文本容器的直接子节点，按 DOM 顺序生成 text/image blocks
+                    for (const child of textContainer.childNodes) {
+                        if (child.nodeType === 3) {
+                            const pt = (child.textContent || '').trim();
+                            if (pt) blocks.push({ type: 'text', richText: [[pt]], plainText: pt });
+                        } else if (child.nodeType === 1) {
+                            const hasText = !!child.querySelector('span[data-text="true"]');
+                            const hasPhoto = child.getAttribute('data-testid') === 'tweetPhoto' ||
+                                !!child.querySelector('[data-testid="tweetPhoto"]');
+
+                            if (hasText) {
+                                const pt = getPlainText(child);
+                                const rt = extractRichText(child);
+                                if (pt.trim()) blocks.push({ type: 'text', richText: rt.length ? rt : [[pt]], plainText: pt });
+                            }
+                            if (hasPhoto) addImagesFromEl(child);
+                            // 既无 data-text 也无 tweetPhoto → UI 元素，跳过
+                        }
+                    }
+
+                    // 文本容器之后的兄弟节点中也可能有图片（X 常见布局）
+                    let sibling = textContainer.nextElementSibling;
+                    while (sibling) {
+                        addImagesFromEl(sibling);
+                        sibling = sibling.nextElementSibling;
+                    }
+                } else {
+                    addImagesFromEl(article);
+                }
+
+                // 视频
+                if (article.querySelector('[data-testid="videoPlayer"], [data-testid="videoComponent"]')) {
+                    blocks.push({ type: 'video' });
+                }
+
+                return blocks;
+            }
+
+            const debug = {};
+
+            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            debug.articleCount = articles.length;
+            if (!articles.length) return { debug, tweets: [], title: '', authorName: '', date: '', url: window.location.href };
+
+            const firstArticle = articles[0];
+            const userNameEl = firstArticle.querySelector('[data-testid="User-Name"]');
+            const authorName = getPlainText(userNameEl?.querySelector('span')) ||
+                getPlainText(userNameEl).split('\n')[0] || 'Unknown';
+            const authorHandleHref = userNameEl?.querySelector('a[href*="/"]')?.getAttribute('href') || '';
+
+            const timeEl = firstArticle.querySelector('time');
+            const dateStr = timeEl?.getAttribute('datetime') || '';
+            const dateShort = dateStr ? new Date(dateStr).toLocaleDateString('zh-CN') : '';
+            const dateISO = dateStr ? new Date(dateStr).toISOString().split('T')[0] : '';
+
+            const firstSpan = firstArticle.querySelector('span[data-text="true"]');
+            debug.hasDataText = !!firstSpan;
+            debug.sampleDataText = firstSpan ? (firstSpan.textContent || '').slice(0, 50) : '(无)';
+
+            // 从推文链接卡片中提取文章标题
+            function findCardTitle(article) {
+                const cardWrapper = article.querySelector('[data-testid="card.wrapper"]');
+                if (!cardWrapper) return null;
+                const cardLink = cardWrapper.querySelector('a');
+                if (!cardLink) return null;
+                // 卡片标题通常是卡片内第一个字符数足够多的 span
+                const spans = cardLink.querySelectorAll('span');
+                for (const span of spans) {
+                    const text = (span.textContent || '').trim();
+                    // 跳过太短的（域名/装饰文本），只取像文章标题的
+                    if (text.length > 8 && !text.match(/^https?:\/\//) && !text.match(/^\w+\.\w{2,}$/)) {
+                        return text;
+                    }
+                }
+                return null;
+            }
+
+            // 清理 markdown 风格字符（去掉开头 # / * 等）
+            function cleanMarkdownTitle(text) {
+                if (!text) return text;
+                return text.replace(/^[#*>\s]+/, '').trim();
+            }
+
+            const tweets = [];
+            for (const article of articles) {
+                const handleHref = article.querySelector('[data-testid="User-Name"] a[href*="/"]')?.getAttribute('href') || '';
+                if (tweets.length > 0 && handleHref && authorHandleHref && handleHref !== authorHandleHref) break;
+
+                const blocks = extractTweetBlocks(article);
+
+                // 兜底：og:description
+                if (!blocks.some(b => b.type === 'text') && tweets.length === 0) {
+                    const ogDesc = document.querySelector('meta[property="og:description"]')?.content ||
+                                   document.querySelector('meta[name="twitter:description"]')?.content || '';
+                    if (ogDesc) {
+                        blocks.unshift({ type: 'text', richText: [[ogDesc]], plainText: ogDesc });
+                        debug.usedMeta = true;
+                    }
+                }
+
+                tweets.push({ blocks });
+            }
+
+            // 使用浏览器 tab 实际标题（去除未读消息数前缀），与网页头部展示一致
+            const pageTitle = document.title.replace(/^\(\d+\)\s*/, '').trim();
+
+            // 兜底：若 document.title 为空，则用作者名 + 推文首句
+            const cardTitle = findCardTitle(firstArticle);
+            const firstText = tweets[0]?.blocks?.find(b => b.type === 'text')?.plainText || '';
+            const rawTitle = cardTitle || firstText.slice(0, 60) + (firstText.length > 60 ? '…' : '');
+            const fallbackTitle = `${authorName}: ${cleanMarkdownTitle(rawTitle)}`;
+
+            const title = pageTitle || fallbackTitle;
+
+            return { title, authorName, date: dateShort, dateISO, url: window.location.href, tweets, debug };
+        }
+    });
+
+    if (results && results[0]?.error) {
+        console.error('[extractXThread] 脚本错误:', results[0].error);
+        throw new Error('页面脚本执行失败: ' + (results[0].error.message || '未知错误'));
+    }
+    if (results && results[0] && results[0].result) return results[0].result;
+    return null;
+}
+
 // === 方案B：当前页直读 (专门解决 Twitter/SPA) ===
 async function extractCurrentTabMetadata(tabId, url) {
     try {
@@ -98,7 +312,7 @@ async function extractCurrentTabMetadata(tabId, url) {
                 const getName = (name) => document.querySelector(`meta[name="${name}"]`)?.content;
 
                 let data = {
-                    title: getMeta('og:title') || document.title,
+                    title: document.title || getMeta('og:title'),
                     description: getMeta('og:description') || getName('description') || "",
                     cover: getMeta('og:image') || "",
                     twitterText: document.querySelector('article div[lang]')?.innerText
@@ -150,7 +364,6 @@ async function extractCurrentTabMetadata(tabId, url) {
             // 清理标题（移除 X/Twitter 未读消息数前缀）
             data.title = cleanTitle(url, data.title);
 
-            console.log("✅ 成功从当前页读取:", data);
             return data;
         }
     } catch (e) {
@@ -162,21 +375,26 @@ async function extractCurrentTabMetadata(tabId, url) {
 // === 初始化 ===
 document.addEventListener('DOMContentLoaded', async () => {
     // 1. 加载所有状态
-    const storageData = await chrome.storage.local.get(['notion_page_id', 'pending_urls', 'pending_caption', 'batch_mode_enabled', 'cover_enabled']);
+    const storageData = await chrome.storage.local.get(['notion_page_id', 'pending_urls', 'pending_caption', 'import_style', 'cover_enabled']);
 
     if (storageData.notion_page_id) document.getElementById('pageId').value = storageData.notion_page_id;
     if (storageData.pending_caption) document.getElementById('caption').value = storageData.pending_caption;
 
     const urlsInput = document.getElementById('urls');
-    const toggleBatchMode = document.getElementById('toggleBatchMode');
-    const batchTools = document.getElementById('batchTools');
-    const urlTip = document.getElementById('urlTip');
-    const captionTip = document.getElementById('captionTip');
-
-    // 封面图相关元素
-    const coverRow = document.getElementById('coverRow');
+    const urlSection = document.getElementById('urlSection');
+    const coverControl = document.getElementById('coverControl');
     const toggleCover = document.getElementById('toggleCover');
     const noCoverTip = document.getElementById('noCoverTip');
+    const coverText = document.getElementById('coverText');
+    const batchUrlTip = document.getElementById('batchUrlTip');
+    const batchTools = document.getElementById('batchTools');
+
+    const captionSection = document.getElementById('captionSection');
+    const captionLabel = document.getElementById('captionLabel');
+    const captionTip = document.getElementById('captionTip');
+    
+    // 导入样式 Radios
+    const styleRadios = document.querySelectorAll('input[name="importStyle"]');
 
     // 当前页面封面图缓存
     let currentPageCover = null;
@@ -192,6 +410,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             url.startsWith('devtools://');
     };
 
+    const updateCoverUI = () => {
+        if (toggleCover.disabled) {
+            noCoverTip.innerText = "该网页无封面图";
+            noCoverTip.classList.remove('hidden');
+            coverText.classList.add('hidden');
+        } else {
+            noCoverTip.classList.add('hidden');
+            coverText.innerText = "封面图:";
+            coverText.classList.remove('hidden');
+        }
+    };
+
     // === 辅助函数：检测当前页面封面图 ===
     const checkCurrentPageCover = async () => {
         try {
@@ -201,93 +431,126 @@ document.addEventListener('DOMContentLoaded', async () => {
             const url = tabs[0].url;
             const tabId = tabs[0].id;
 
-            // 跳过特殊 URL，避免执行脚本报错
             if (isRestrictedUrl(url)) {
-                noCoverTip.classList.remove('hidden');
                 toggleCover.disabled = true;
                 toggleCover.checked = false;
                 return;
             }
 
-            // 使用现有的 extractCurrentTabMetadata 获取 meta 信息
             const meta = await extractCurrentTabMetadata(tabId, url);
             currentPageCover = meta.cover;
 
-            // 更新 UI 状态
             if (currentPageCover) {
-                noCoverTip.classList.add('hidden');
                 toggleCover.disabled = false;
             } else {
-                noCoverTip.classList.remove('hidden');
                 toggleCover.disabled = true;
                 toggleCover.checked = false;
             }
         } catch (e) {
             console.warn('检测封面图失败:', e);
-            noCoverTip.classList.remove('hidden');
             toggleCover.disabled = true;
+        } finally {
+            const currentStyle = document.querySelector('input[name="importStyle"]:checked').value;
+            if (currentStyle === 'bookmark') {
+                updateCoverUI();
+            }
         }
     };
 
     // === 辅助函数：更新 UI 状态 ===
-    const updateUIState = async (isBatchMode) => {
-        if (isBatchMode) {
-            // 批量模式
-            batchTools.classList.remove('hidden');
-            coverRow.classList.add('hidden'); // 批量模式隐藏封面图开关
-            urlTip.innerText = "*批量模式：支持填充多个链接";
-            captionTip.innerText = "*多个链接的情况下，备注会被覆盖";
-
-            // 恢复草稿（如果有），否则留空让用户自己填
-            chrome.storage.local.get(['pending_urls'], (res) => {
-                const draft = res.pending_urls;
-                // 如果有草稿，恢复草稿；如果没草稿，显示空（不自动填当前页，除非用户点按钮）
-                urlsInput.value = draft || "";
-            });
-            urlsInput.readOnly = false;
-        } else {
-            // 默认模式（单页）
-            batchTools.classList.add('hidden');
-            coverRow.classList.remove('hidden'); // 默认模式显示封面图开关
-            urlTip.innerText = "*默认模式：自动填充当前页面";
-            captionTip.innerText = "*填写后会显示在bookmark卡片下方";
-
-            // 强制填充当前页
+    const updateUIState = async (style) => {
+        // 先隐藏所有条件区域
+        coverControl.classList.add('hidden');
+        batchUrlTip.classList.add('hidden');
+        batchTools.classList.add('hidden');
+        
+        if (style === 'tweet') {
+            // 推文页面模式
+            urlSection.classList.remove('hidden');
+            captionSection.classList.remove('hidden');
+            captionLabel.innerText = "标签（选填）";
+            captionTip.classList.add('hidden');
+            
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tabs && tabs[0]) {
                 urlsInput.value = tabs[0].url;
-                // 默认模式下不保存草稿，清除 pending_urls
-                chrome.storage.local.remove('pending_urls');
             }
-            // 默认模式下也可以允许用户微调 URL，所以保持 readOnly = false
+            urlsInput.readOnly = true;
+        } else if (style === 'batch') {
+            // 批量模式
+            urlSection.classList.remove('hidden');
+            captionSection.classList.remove('hidden');
+            batchUrlTip.classList.remove('hidden');
+            batchTools.classList.remove('hidden');
+            captionLabel.innerText = "备注（选填）";
+            captionTip.innerText = "*多个链接的情况下，备注会被覆盖";
+            captionTip.classList.remove('hidden');
+            
+            chrome.storage.local.get(['pending_urls'], (res) => {
+                urlsInput.value = res.pending_urls || "";
+            });
+            urlsInput.readOnly = false;
+        } else {
+            // 默认模式（书签）
+            urlSection.classList.remove('hidden');
+            captionSection.classList.remove('hidden');
+            coverControl.classList.remove('hidden');
+            coverControl.style.display = 'flex'; // override hidden properly
+            captionLabel.innerText = "备注（选填）";
+            captionTip.innerText = "*填写后会显示在bookmark卡片下方";
+            captionTip.classList.remove('hidden');
+            
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tabs && tabs[0]) {
+                urlsInput.value = tabs[0].url;
+            }
             urlsInput.readOnly = false;
 
-            // 检测当前页面封面图
             await checkCurrentPageCover();
+            updateCoverUI();
         }
     };
 
-    // 2. 恢复开关状态
-    const isBatchStart = !!storageData.batch_mode_enabled;
-    toggleBatchMode.checked = isBatchStart;
+    // 2. 恢复状态并检查是否允许推文模式
+    const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const isTwitterPage = activeTabs[0] && (activeTabs[0].url.includes('x.com') || activeTabs[0].url.includes('twitter.com'));
+    
+    const tweetRadioNode = Array.from(styleRadios).find(r => r.value === 'tweet');
+    if (!isTwitterPage && tweetRadioNode) {
+        tweetRadioNode.disabled = true;
+    }
+
+    let initialStyle = storageData.import_style || 'bookmark';
+    if (!isTwitterPage && initialStyle === 'tweet') {
+        initialStyle = 'bookmark';
+    }
+
+    let targetRadio = Array.from(styleRadios).find(r => r.value === initialStyle);
+    if (!targetRadio) targetRadio = styleRadios[0];
+    targetRadio.checked = true;
 
     // 恢复封面图开关状态（默认关闭）
     toggleCover.checked = !!storageData.cover_enabled;
 
-    await updateUIState(isBatchStart);
+    await updateUIState(initialStyle);
 
     // === 事件监听 ===
 
-    // 批量模式开关监听
-    toggleBatchMode.addEventListener('change', (e) => {
-        const isBatch = e.target.checked;
-        chrome.storage.local.set({ 'batch_mode_enabled': isBatch });
-        updateUIState(isBatch);
+    // Radio 切换监听
+    styleRadios.forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            if (e.target.checked) {
+                const style = e.target.value;
+                chrome.storage.local.set({ 'import_style': style });
+                updateUIState(style);
+            }
+        });
     });
 
     // 封面图开关监听
     toggleCover.addEventListener('change', (e) => {
         chrome.storage.local.set({ 'cover_enabled': e.target.checked });
+        updateCoverUI();
     });
 
     // 输入同步 Storage
@@ -296,11 +559,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('input', (e) => {
             if (id === 'urls') {
-                if (toggleBatchMode.checked) {
+                const currentStyle = document.querySelector('input[name="importStyle"]:checked').value;
+                if (currentStyle === 'batch') {
                     chrome.storage.local.set({ 'pending_urls': e.target.value });
                 }
             } else {
-                // pageId 和 caption 还是正常保存
                 const key = id === 'caption' ? 'pending_caption' : 'notion_page_id';
                 const obj = {}; obj[key] = e.target.value;
                 chrome.storage.local.set(obj);
@@ -320,7 +583,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                 let val = urlsInput.value.trimEnd();
 
                 if (val.length > 0) {
-                    // 避免重复
                     if (!val.includes(currentUrl)) {
                         val += '\n' + currentUrl;
                     }
@@ -352,9 +614,10 @@ document.getElementById('btnImport').addEventListener('click', async () => {
     const urlsText = document.getElementById('urls').value;
     const manualCaption = document.getElementById('caption').value.trim();
 
-    // 获取封面图开关状态（仅默认模式有效）
-    const isBatchMode = document.getElementById('toggleBatchMode').checked;
-    const importCoverEnabled = !isBatchMode && document.getElementById('toggleCover').checked;
+    const selectedStyle = document.querySelector('input[name="importStyle"]:checked').value;
+    const isBatchMode = selectedStyle === 'batch';
+    const isTweetMode = selectedStyle === 'tweet';
+    const importCoverEnabled = !isBatchMode && !isTweetMode && document.getElementById('toggleCover').checked;
 
     const status = document.getElementById('status');
     const btn = document.getElementById('btnImport');
@@ -362,6 +625,58 @@ document.getElementById('btnImport').addEventListener('click', async () => {
     const cleanId = extractUUID(rawInput);
     if (!cleanId) { status.innerText = "❌ ID 格式错误"; return; }
     const pageId = formatUUID(cleanId);
+
+    // === 推文页面模式 ===
+    if (isTweetMode) {
+        btn.disabled = true;
+        status.style.color = "blue";
+        status.innerText = "🔍 提取推文内容...";
+        try {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            const tab = tabs[0];
+            if (!tab || (!tab.url.includes('x.com') && !tab.url.includes('twitter.com'))) {
+                throw new Error("请先打开一个 X / Twitter 推文页面");
+            }
+
+            const threadData = await extractXThread(tab.id);
+            if (!threadData || !threadData.tweets.length) {
+                throw new Error("未找到推文内容，请确认页面已完整加载");
+            }
+
+            // 显示提取摘要
+            const blocks0 = threadData.tweets[0]?.blocks || [];
+            const textBlocks = blocks0.filter(b => b.type === 'text').length;
+            const imgBlocks = blocks0.filter(b => b.type === 'image').length;
+            const preview = blocks0.find(b => b.type === 'text')?.plainText?.slice(0, 25) || '(空)';
+            status.innerText = `${threadData.tweets.length}条 | 段落:${textBlocks} 图:${imgBlocks} | "${preview}"`;
+            await new Promise(r => setTimeout(r, 3000));
+
+            status.innerText = "📝 创建 Notion 页面...";
+            const userId = await getCurrentUserId();
+            if (!userId) throw new Error("请先登录 www.notion.so");
+
+            const pageInfo = await getPageInfo(pageId, userId);
+            const { spaceId, isDatabase, collectionId, schema } = pageInfo;
+
+            if (isDatabase && collectionId) {
+                await createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, manualCaption);
+                status.innerText = `✅ 已导入至 Database（${threadData.tweets.length} 条推文）`;
+            } else {
+                await createNotionPageFromThread(spaceId, pageId, threadData, userId, manualCaption);
+                status.innerText = `✅ 已导入 ${threadData.tweets.length} 条推文`;
+            }
+            status.style.color = "green";
+            document.getElementById('caption').value = "";
+            chrome.storage.local.remove('pending_caption');
+        } catch (err) {
+            console.error(err);
+            status.innerText = "❌ " + err.message;
+            status.style.color = "red";
+        } finally {
+            btn.disabled = false;
+        }
+        return;
+    }
 
     // 1. 确定目标 URL 列表
     let targets = [];
@@ -383,7 +698,6 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 
     status.style.color = "blue";
     btn.disabled = true;
-    const originalReadOnly = document.getElementById('urls').readOnly;
     document.getElementById('urls').readOnly = true;
 
     try {
@@ -439,7 +753,7 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 
                 document.getElementById('urls').value = newContent;
 
-                const isBatchMode = document.getElementById('toggleBatchMode').checked;
+                const isBatchMode = document.querySelector('input[name="importStyle"]:checked').value === 'batch';
                 if (isBatchMode) {
                     chrome.storage.local.set({ 'pending_urls': newContent });
                 }
@@ -457,7 +771,7 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 
                 document.getElementById('urls').value = newContent;
 
-                const isBatchMode = document.getElementById('toggleBatchMode').checked;
+                const isBatchMode = document.querySelector('input[name="importStyle"]:checked').value === 'batch';
                 if (isBatchMode) {
                     chrome.storage.local.set({ 'pending_urls': newContent });
                 }
@@ -490,6 +804,32 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 });
 
 // === Notion API ===
+
+// 获取页面信息：spaceId + 是否为 Database + collection 信息
+async function getPageInfo(pageId, userId) {
+    const res = await fetch("https://www.notion.so/api/v3/loadPageChunk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
+        body: JSON.stringify({
+            "pageId": pageId, "limit": 50, "cursor": { "stack": [] }, "chunkNumber": 0, "verticalColumns": false
+        })
+    });
+    const data = await res.json();
+    const blockData = data.recordMap?.block?.[pageId];
+    if (!blockData?.value) throw new Error("无法读取页面信息，请检查 ID");
+
+    const spaceId = blockData.value.space_id;
+    const isDatabase = ['collection_view_page', 'collection_view'].includes(blockData.value.type);
+    const collectionId = blockData.value.collection_id || null;
+
+    let schema = null;
+    if (collectionId && data.recordMap?.collection?.[collectionId]) {
+        schema = data.recordMap.collection[collectionId].value?.schema || null;
+    }
+
+    return { spaceId, isDatabase, collectionId, schema };
+}
+
 async function getSpaceIdViaLoadChunk(pageId, userId) {
     const res = await fetch("https://www.notion.so/api/v3/loadPageChunk", {
         method: "POST",
@@ -542,6 +882,299 @@ async function createFullBookmark(spaceId, parentId, meta, url, userId, caption)
         body: JSON.stringify({ "requestId": uuidv4(), "transactions": [{ "id": uuidv4(), "spaceId": spaceId, "operations": operations }] })
     });
     if (!res.ok) throw new Error("写入失败");
+}
+
+// === Markdown → Notion 块类型解析 ===
+function stripRichTextPrefix(richText, prefixLen) {
+    if (!richText || !richText.length) return richText;
+    const result = richText.map(s => [...s]);
+    if (result[0] && typeof result[0][0] === 'string') {
+        result[0][0] = result[0][0].slice(prefixLen);
+        if (!result[0][0] && result.length > 1) result.shift();
+    }
+    return result.filter(s => s[0]);
+}
+
+// 按换行符将 richText 切分为多行，每行保留原有格式标注
+function splitRichTextByLines(richText) {
+    const lines = [];
+    let current = [];
+    for (const seg of (richText || [])) {
+        const text = seg[0] || '';
+        const anns = seg[1] || null;
+        const parts = text.split('\n');
+        for (let i = 0; i < parts.length; i++) {
+            if (parts[i]) current.push(anns ? [parts[i], anns] : [parts[i]]);
+            if (i < parts.length - 1) { lines.push(current); current = []; }
+        }
+    }
+    if (current.length) lines.push(current);
+    return lines;
+}
+
+
+function parseLineToNotionBlock(text, richText) {
+    let m;
+    m = text.match(/^(### )(.+)/);  if (m) return { notionType: 'sub_sub_header', richText: stripRichTextPrefix(richText, m[1].length) };
+    m = text.match(/^(## )(.+)/);   if (m) return { notionType: 'sub_header',     richText: stripRichTextPrefix(richText, m[1].length) };
+    m = text.match(/^(# )(.+)/);    if (m) return { notionType: 'header',          richText: stripRichTextPrefix(richText, m[1].length) };
+    m = text.match(/^([-*•] )(.+)/);if (m) return { notionType: 'bulleted_list',   richText: stripRichTextPrefix(richText, m[1].length) };
+    m = text.match(/^(\d+[.)]\s+)(.+)/); if (m) return { notionType: 'text', richText };
+    m = text.match(/^(> )(.+)/);    if (m) return { notionType: 'quote',           richText: stripRichTextPrefix(richText, m[1].length) };
+    return { notionType: 'text', richText };
+}
+
+// 将一个 text block 展开为一到多个 Notion 块（处理换行 + markdown）
+function parseTextBlockToNotionBlocks(block) {
+    const text = block.plainText || '';
+    const lines = text.split('\n');
+    if (lines.length <= 1) {
+        return [parseLineToNotionBlock(text.trim(), block.richText || [[text]])];
+    }
+    // 多行时：按行切分，同时保留每行的 richText 格式标注
+    const richTextLines = splitRichTextByLines(block.richText || [[text]]);
+    return lines
+        .map((l, i) => ({ text: l.trim(), rt: richTextLines[i] || [[l.trim()]] }))
+        .filter(({ text }) => text)
+        .map(({ text, rt }) => parseLineToNotionBlock(text, rt));
+}
+
+// === 辅助：在 Database schema 中查找匹配属性，找不到则规划新建 ===
+function findOrPlanSchemaKey(schema, names, type) {
+    if (schema) {
+        for (const [key, prop] of Object.entries(schema)) {
+            if (key === 'title') continue;
+            if (names.some(n => prop.name?.toLowerCase() === n.toLowerCase()) && prop.type === type) {
+                return { key, create: false, name: prop.name, type: prop.type };
+            }
+        }
+    }
+    // Notion schema key 惯用 4 位随机串
+    let key;
+    do { key = Math.random().toString(36).slice(2, 6); } while (schema && schema[key]);
+    return { key, create: true, name: names[0], type };
+}
+
+// === 推文线程 → Notion Database 页面 ===
+async function createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, tags) {
+    const pageId = uuidv4();
+    const operations = [];
+
+    // 查找或规划属性的 schema key
+    const authorProp = findOrPlanSchemaKey(schema, ['Author', '作者'], 'text');
+    const urlProp    = findOrPlanSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
+    const dateProp   = findOrPlanSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
+    const tagsProp   = findOrPlanSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
+
+    // 处理 tags 的 schema 属性
+    let finalTagsStr = null;
+    if (tags && tags.trim()) {
+        const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
+        const existingOptions = (!tagsProp.create && schema && schema[tagsProp.key] && schema[tagsProp.key].options) ? schema[tagsProp.key].options : [];
+        const existingValues = existingOptions.map(o => o.value);
+        let newOptions = [...existingOptions];
+        let hasNew = false;
+        
+        for (const t of inputTags) {
+            if (!existingValues.includes(t)) {
+                newOptions.push({
+                    id: uuidv4(),
+                    value: t,
+                    color: ['default', 'gray', 'brown', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink', 'red'][Math.floor(Math.random() * 10)]
+                });
+                hasNew = true;
+            }
+        }
+        
+        if (hasNew) {
+            tagsProp.create = true;
+            tagsProp.updatedOptions = newOptions;
+        } else if (tagsProp.create) {
+            tagsProp.updatedOptions = [];
+        }
+        
+        if (inputTags.length > 0) {
+            finalTagsStr = inputTags.join(',');
+        }
+    } else if (tagsProp.create) {
+        tagsProp.updatedOptions = [];
+    }
+
+    // 如需新建属性，先写入 collection schema
+    for (const prop of [authorProp, urlProp, dateProp, tagsProp]) {
+        if (prop.create) {
+            const args = { name: prop.name, type: prop.type };
+            if (prop.type === 'multi_select' && prop.updatedOptions) {
+                args.options = prop.updatedOptions;
+            }
+            operations.push({
+                id: collectionId, table: "collection",
+                path: ["schema", prop.key], command: "update",
+                args: args
+            });
+        }
+    }
+
+    // 构建 properties
+    const properties = { title: [[threadData.title || "推文"]] };
+    if (threadData.authorName) properties[authorProp.key] = [[threadData.authorName]];
+    if (threadData.url)        properties[urlProp.key]    = [[threadData.url]];
+    if (threadData.dateISO)    properties[dateProp.key]   = [['‣', [['d', { type: 'date', start_date: threadData.dateISO }]]]];
+    if (finalTagsStr)          properties[tagsProp.key]   = [[finalTagsStr]];
+
+    const format = { page_icon: randomTweetIcon() };
+
+    // 创建 Database 页（parent_table 为 "collection"）
+    operations.push({
+        id: pageId, table: "block", path: [], command: "set",
+        args: {
+            id: pageId, type: "page", version: 1, alive: true,
+            parent_id: collectionId, parent_table: "collection", space_id: spaceId,
+            created_time: Date.now(), last_edited_time: Date.now(),
+            properties, format
+        }
+    });
+
+    // 写入推文内容块（与普通页面逻辑相同）
+    let lastBlockId = null;
+    const addBlock = (type, blockArgs) => {
+        const blockId = uuidv4();
+        operations.push({
+            id: blockId, table: "block", path: [], command: "set",
+            args: {
+                id: blockId, type, version: 1, alive: true,
+                parent_id: pageId, parent_table: "block", space_id: spaceId,
+                created_time: Date.now(), last_edited_time: Date.now(),
+                ...blockArgs
+            }
+        });
+        operations.push({
+            id: pageId, table: "block", path: ["content"], command: "listAfter",
+            args: { after: lastBlockId || uuidv4(), id: blockId }
+        });
+        lastBlockId = blockId;
+    };
+
+    for (let i = 0; i < threadData.tweets.length; i++) {
+        const tweet = threadData.tweets[i];
+        for (const block of (tweet.blocks || [])) {
+            if (block.type === 'text') {
+                const notionBlocks = parseTextBlockToNotionBlocks(block);
+                for (const nb of notionBlocks) {
+                    addBlock(nb.notionType, { properties: { title: nb.richText } });
+                }
+            } else if (block.type === 'image') {
+                addBlock("image", {
+                    properties: { source: [[block.url]] },
+                    format: { display_source: block.url }
+                });
+            } else if (block.type === 'video') {
+                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
+            }
+        }
+        if (i < threadData.tweets.length - 1) addBlock("divider", {});
+    }
+
+    const res = await fetch("https://www.notion.so/api/v3/saveTransactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
+        body: JSON.stringify({ requestId: uuidv4(), transactions: [{ id: uuidv4(), spaceId, operations }] })
+    });
+    const resText = await res.text();
+    if (!res.ok) throw new Error("创建 Database 页面失败: " + resText.slice(0, 100));
+    return pageId;
+}
+
+// === 推文线程 → 独立 Notion 页面 ===
+async function createNotionPageFromThread(spaceId, parentId, threadData, userId, tags) {
+    const pageId = uuidv4();
+    const operations = [];
+    let lastBlockId = null;
+
+    // 创建子页面
+    operations.push({
+        id: pageId, table: "block", path: [], command: "set",
+        args: {
+            id: pageId, type: "page", version: 1, alive: true,
+            parent_id: parentId, parent_table: "block", space_id: spaceId,
+            created_time: Date.now(), last_edited_time: Date.now(),
+            properties: { title: [[threadData.title || "推文"]] },
+            format: { page_icon: randomTweetIcon() }
+        }
+    });
+    operations.push({
+        id: parentId, table: "block", path: ["content"], command: "listAfter",
+        args: { after: uuidv4(), id: pageId }
+    });
+
+    // 向页面内追加块的辅助函数
+    const addBlock = (type, blockArgs) => {
+        const blockId = uuidv4();
+        operations.push({
+            id: blockId, table: "block", path: [], command: "set",
+            args: {
+                id: blockId, type, version: 1, alive: true,
+                parent_id: pageId, parent_table: "block", space_id: spaceId,
+                created_time: Date.now(), last_edited_time: Date.now(),
+                ...blockArgs
+            }
+        });
+        operations.push({
+            id: pageId, table: "block", path: ["content"], command: "listAfter",
+            args: { after: lastBlockId || uuidv4(), id: blockId }
+        });
+        lastBlockId = blockId;
+    };
+
+    // 插入外部网页信息（仅限普通页面，不影响 Database）
+    if (threadData.authorName) {
+        addBlock("text", { properties: { title: [["👤 作者："], [threadData.authorName, [["b"]]]] } });
+    }
+    if (threadData.dateISO || threadData.date) {
+        addBlock("text", { properties: { title: [["🗓️ 日期："], [threadData.dateISO || threadData.date]] } });
+    }
+    if (threadData.url) {
+        addBlock("text", { properties: { title: [["🔗 链接："], [threadData.url, [["a", threadData.url]]]] } });
+    }
+    if (tags && tags.trim()) {
+        addBlock("text", { properties: { title: [["🏷️ 标签："], [tags.trim()]] } });
+    }
+    // 加入分割线区分正文
+    if (threadData.authorName || threadData.dateISO || threadData.url || (tags && tags.trim())) {
+        addBlock("divider", {});
+    }
+
+    // 逐条推文写入
+    for (let i = 0; i < threadData.tweets.length; i++) {
+        const tweet = threadData.tweets[i];
+        for (const block of (tweet.blocks || [])) {
+            if (block.type === 'text') {
+                const notionBlocks = parseTextBlockToNotionBlocks(block);
+                for (const nb of notionBlocks) {
+                    addBlock(nb.notionType, { properties: { title: nb.richText } });
+                }
+            } else if (block.type === 'image') {
+                addBlock("image", {
+                    properties: { source: [[block.url]] },
+                    format: { display_source: block.url }
+                });
+            } else if (block.type === 'video') {
+                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
+            }
+        }
+        if (i < threadData.tweets.length - 1) {
+            addBlock("divider", {});
+        }
+    }
+
+    const res = await fetch("https://www.notion.so/api/v3/saveTransactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
+        body: JSON.stringify({ requestId: uuidv4(), transactions: [{ id: uuidv4(), spaceId, operations }] })
+    });
+    const resText = await res.text();
+    if (!res.ok) throw new Error("创建页面失败: " + resText.slice(0, 100));
+    return pageId;
 }
 
 // 创建图片块

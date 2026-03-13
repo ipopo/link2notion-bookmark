@@ -7,47 +7,59 @@
 </head>
 
 <body>
-    <h3>🐜 Notion 终极书签助手</h3>
+    <h3>🐜 Notion 导入助手</h3>
 
-    <label>Notion 页面地址</label>
-    <input type="text" id="pageId" placeholder="填写 Share Copy Link 或 Page ID">
+    <label>Notion 地址</label>
+    <input type="text" id="pageId" placeholder="填写你有编辑权限的页面地址">
 
-    <!-- 批量模式开关 -->
-    <div class="mode-row">
-        <label>批量模式</label>
-        <label class="switch">
-            <input type="checkbox" id="toggleBatchMode">
-            <span class="slider"></span>
+    <label>导入样式</label>
+    <div class="import-style-group">
+        <label class="style-option">
+            <input type="radio" name="importStyle" value="bookmark" checked>
+            <span>书签</span>
         </label>
-    </div>
-
-    <!-- 导入封面图开关（仅默认模式显示） -->
-    <div id="coverRow" class="mode-row">
-        <div class="cover-label-group">
-            <label>导入封面图</label>
-            <span id="noCoverTip" class="no-cover-tip hidden">该网页无封面图</span>
-        </div>
-        <label class="switch">
-            <input type="checkbox" id="toggleCover">
-            <span class="slider"></span>
+        <label class="style-option">
+            <input type="radio" name="importStyle" value="tweet">
+            <span>推特长文</span>
+        </label>
+        <label class="style-option">
+            <input type="radio" name="importStyle" value="batch">
+            <span>批量链接</span>
         </label>
     </div>
 
     <div class="divider"></div>
 
-    <label>导入链接</label>
-    <div id="urlTip" class="tips">*默认模式：自动填充当前页面</div>
-    <textarea id="urls"></textarea>
+    <div id="urlSection">
+        <div class="section-header" id="urlSectionHeader">
+            <label id="urlLabel">网页链接</label>
+            <!-- 封面控制（书签模式） -->
+            <div id="coverControl" class="cover-control hidden">
+                <span id="noCoverTip" class="no-cover-tip hidden">该网页无封面图</span>
+                <span id="coverText">封面图:</span>
+                <label class="switch">
+                    <input type="checkbox" id="toggleCover">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <!-- 批量提示（批量模式） -->
+            <span id="batchUrlTip" class="header-tip hidden">*支持填充多个链接</span>
+        </div>
+        
+        <textarea id="urls"></textarea>
 
-    <!-- 工具栏（仅批量模式显示） -->
-    <div id="batchTools" class="url-controls hidden">
-        <button id="btnAutoFill" class="tool-btn">⚡ 填充链接</button>
-        <button id="btnClear" class="tool-btn">🗑️ 清空</button>
+        <!-- 工具栏（批量模式显示） -->
+        <div id="batchTools" class="url-controls hidden">
+            <button id="btnAutoFill" class="tool-btn">⚡ 填充链接</button>
+            <button id="btnClear" class="tool-btn">🗑️ 清空</button>
+        </div>
     </div>
 
-    <label style="margin-top: 15px;">备注（选填）</label>
-    <div id="captionTip" class="tips">*填写后会显示在bookmark卡片下方</div>
-    <input type="text" id="caption">
+    <div id="captionSection">
+        <label id="captionLabel">备注（选填）</label>
+        <div id="captionTip" class="tips">*填写后会显示在bookmark卡片下方</div>
+        <input type="text" id="caption">
+    </div>
 
     <button id="btnImport">开始导入</button>
     <div id="status"></div>
