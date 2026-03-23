@@ -178,28 +178,62 @@ async function extractXThread(tabId) {
                             const pt = (child.textContent || '').trim();
                             if (pt) blocks.push({ type: 'text', richText: [[pt]], plainText: pt });
                         } else if (child.nodeType === 1) {
-                            const hasText = !!child.querySelector('span[data-text="true"]');
-                            const hasPhoto = child.getAttribute('data-testid') === 'tweetPhoto' ||
-                                !!child.querySelector('[data-testid="tweetPhoto"]');
+                            // 检测代码块（Twitter 的 markdown-code-block）
+                            const codeBlockEl = child.querySelector('[data-testid="markdown-code-block"]') ||
+                                (child.getAttribute && child.getAttribute('data-testid') === 'markdown-code-block' ? child : null);
+                            if (codeBlockEl) {
+                                const codeEl = codeBlockEl.querySelector('pre code') || codeBlockEl.querySelector('pre');
+                                if (codeEl) {
+                                    const codeText = codeEl.textContent || '';
+                                    const langMatch = ((codeBlockEl.querySelector('code') || {}).className || '').match(/language-(\w+)/);
+                                    const lang = langMatch ? langMatch[1] : '';
+                                    blocks.push({ type: 'code', text: codeText, language: lang === 'text' ? 'Plain Text' : (lang || 'Plain Text') });
+                                }
+                            } else {
+                                const hasText = !!child.querySelector('span[data-text="true"]');
+                                const hasPhoto = child.getAttribute('data-testid') === 'tweetPhoto' ||
+                                    !!child.querySelector('[data-testid="tweetPhoto"]');
 
-                            if (hasText) {
-                                const pt = getPlainText(child);
-                                const rt = extractRichText(child);
-                                if (pt.trim()) blocks.push({ type: 'text', richText: rt.length ? rt : [[pt]], plainText: pt });
+                                if (hasText) {
+                                    const pt = getPlainText(child);
+                                    const rt = extractRichText(child);
+                                    if (pt.trim()) blocks.push({ type: 'text', richText: rt.length ? rt : [[pt]], plainText: pt });
+                                }
+                                if (hasPhoto) addImagesFromEl(child);
+                                // 既无 data-text 也无 tweetPhoto 也无代码块 → UI 元素，跳过
                             }
-                            if (hasPhoto) addImagesFromEl(child);
-                            // 既无 data-text 也无 tweetPhoto → UI 元素，跳过
                         }
                     }
 
-                    // 文本容器之后的兄弟节点中也可能有图片（X 常见布局）
+                    // 文本容器之后的兄弟节点中也可能有图片或代码块（X 常见布局）
                     let sibling = textContainer.nextElementSibling;
                     while (sibling) {
                         addImagesFromEl(sibling);
+                        const sibCodeBlock = sibling.querySelector('[data-testid="markdown-code-block"]') ||
+                            (sibling.getAttribute && sibling.getAttribute('data-testid') === 'markdown-code-block' ? sibling : null);
+                        if (sibCodeBlock) {
+                            const codeEl = sibCodeBlock.querySelector('pre code') || sibCodeBlock.querySelector('pre');
+                            if (codeEl) {
+                                const codeText = codeEl.textContent || '';
+                                const langMatch = ((sibCodeBlock.querySelector('code') || {}).className || '').match(/language-(\w+)/);
+                                const lang = langMatch ? langMatch[1] : '';
+                                blocks.push({ type: 'code', text: codeText, language: lang === 'text' ? 'Plain Text' : (lang || 'Plain Text') });
+                            }
+                        }
                         sibling = sibling.nextElementSibling;
                     }
                 } else {
                     addImagesFromEl(article);
+                    // 无 textContainer 时，扫描整个 article 中的代码块
+                    article.querySelectorAll('[data-testid="markdown-code-block"]').forEach(codeBlockEl => {
+                        const codeEl = codeBlockEl.querySelector('pre code') || codeBlockEl.querySelector('pre');
+                        if (codeEl) {
+                            const codeText = codeEl.textContent || '';
+                            const langMatch = ((codeBlockEl.querySelector('code') || {}).className || '').match(/language-(\w+)/);
+                            const lang = langMatch ? langMatch[1] : '';
+                            blocks.push({ type: 'code', text: codeText, language: lang === 'text' ? 'Plain Text' : (lang || 'Plain Text') });
+                        }
+                    });
                 }
 
                 // 视频
@@ -723,6 +757,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         articleTip.classList.add('hidden');
         batchUrlTip.classList.add('hidden');
         batchTools.classList.add('hidden');
+        hideTagSuggestions();
 
         if (style === 'article') {
             // 文章模式
@@ -735,6 +770,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tabs && tabs[0]) {
                 urlsInput.value = tabs[0].url;
+                showTagSuggestions(tabs[0].title);
             }
             urlsInput.readOnly = true;
         } else if (style === 'tweet') {
@@ -747,6 +783,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tabs && tabs[0]) {
                 urlsInput.value = tabs[0].url;
+                showTagSuggestions(tabs[0].title);
             }
             urlsInput.readOnly = true;
         } else if (style === 'batch') {
@@ -847,6 +884,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const obj = {}; obj[key] = e.target.value;
                 chrome.storage.local.set(obj);
             }
+            // 手动编辑标签时同步芯片选中状态
+            if (id === 'caption') updateTagChipStates();
         });
     });
 
@@ -887,6 +926,87 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
+// === 标签建议 ===
+function generateTagSuggestions(title) {
+    if (!title) return [];
+    title = title.replace(/^\(\d+\)\s*/, '');
+    // 去除 Twitter/X 标题包装
+    title = title.replace(/^X 上的\s+/, '');
+    title = title.replace(/\s+on X\s*$/i, '');
+    title = title.replace(/\s*\/\s*X\s*$/, '');
+    // 去除引号
+    title = title.replace(/[""「」『』""]/g, '');
+
+    const tags = [];
+    const seen = new Set();
+    const addTag = (t) => { if (t && t.length >= 2 && !seen.has(t)) { seen.add(t); tags.push(t); } };
+
+    // 按分隔符拆分（含中文逗号、句号）
+    const segments = title.split(/\s+[-–—|·]\s+|\s+\/\s+|\s*：\s*|:\s+|\s*[，,。；]\s*/)
+        .map(s => s.trim())
+        .filter(s => s.length >= 2);
+
+    // 短段直接作为标签
+    for (const seg of segments) {
+        if (seg.length <= 12) addTag(seg);
+    }
+
+    // 从全文提取英文术语（技术关键词）
+    const engTerms = title.match(/[A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*/g) || [];
+    engTerms.forEach(t => addTag(t));
+
+    return tags.slice(0, 6);
+}
+
+function showTagSuggestions(title) {
+    const container = document.getElementById('tagSuggestions');
+    const tags = generateTagSuggestions(title);
+    if (!tags.length) {
+        container.classList.add('hidden');
+        return;
+    }
+    container.innerHTML = '';
+    tags.forEach(tag => {
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.textContent = tag;
+        chip.addEventListener('click', () => toggleTag(tag));
+        container.appendChild(chip);
+    });
+    container.classList.remove('hidden');
+    updateTagChipStates();
+}
+
+function hideTagSuggestions() {
+    const container = document.getElementById('tagSuggestions');
+    container.innerHTML = '';
+    container.classList.add('hidden');
+}
+
+function toggleTag(tag) {
+    const captionInput = document.getElementById('caption');
+    const current = captionInput.value.trim();
+    const tags = current ? current.split(/[,，]/).map(t => t.trim()).filter(Boolean) : [];
+    const idx = tags.indexOf(tag);
+    if (idx >= 0) {
+        tags.splice(idx, 1);
+    } else {
+        tags.push(tag);
+    }
+    captionInput.value = tags.join('，');
+    chrome.storage.local.set({ 'pending_caption': captionInput.value });
+    updateTagChipStates();
+}
+
+function updateTagChipStates() {
+    const captionInput = document.getElementById('caption');
+    const current = captionInput.value.trim();
+    const activeTags = current ? current.split(/[,，]/).map(t => t.trim()).filter(Boolean) : [];
+    document.querySelectorAll('#tagSuggestions .tag-chip').forEach(chip => {
+        chip.classList.toggle('active', activeTags.includes(chip.textContent));
+    });
+}
+
 // === 进度条辅助函数 ===
 const _importProgress = document.getElementById('importProgress');
 const _progressBar = document.getElementById('progressBar');
@@ -915,11 +1035,44 @@ function hideProgress() {
     _progressText.classList.remove('done');
 }
 
-async function completeProgress(text) {
+function getNotionUrl(id) {
+    return `https://www.notion.so/${id.replace(/-/g, '')}`;
+}
+
+async function completeProgress(text, notionUrl) {
     _progressBar.classList.add('done');
     _progressText.classList.add('done');
-    _progressText.textContent = text;
-    await new Promise(r => setTimeout(r, 2000));
+
+    if (notionUrl) {
+        _progressText.textContent = '';
+
+        const msg = document.createElement('div');
+        msg.textContent = text;
+        _progressText.appendChild(msg);
+
+        const linkBtn = document.createElement('a');
+        linkBtn.href = '#';
+        linkBtn.className = 'notion-link-btn';
+        linkBtn.textContent = '📄 在 Notion 中查看';
+        linkBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            chrome.tabs.create({ url: notionUrl });
+        });
+        _progressText.appendChild(linkBtn);
+
+        const countdown = document.createElement('div');
+        countdown.className = 'countdown-text';
+        _progressText.appendChild(countdown);
+
+        for (let i = 3; i > 0; i--) {
+            countdown.textContent = `${i} 秒后关闭`;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    } else {
+        _progressText.textContent = text;
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
     hideProgress();
 }
 
@@ -994,11 +1147,11 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             const { spaceId, isDatabase, collectionId, schema } = pageInfo;
 
             if (isDatabase && collectionId) {
-                await createDatabasePageFromArticle(spaceId, collectionId, schema, articleData, userId, manualCaption);
-                await completeProgress(`✅ 已导入文章至 Database`);
+                const newPageId = await createDatabasePageFromArticle(spaceId, collectionId, schema, articleData, userId, manualCaption);
+                await completeProgress(`✅ 已导入文章至 Database`, getNotionUrl(newPageId));
             } else {
-                await createNotionPageFromArticle(spaceId, pageId, articleData, userId, manualCaption);
-                await completeProgress(`✅ 已导入文章`);
+                const newPageId = await createNotionPageFromArticle(spaceId, pageId, articleData, userId, manualCaption);
+                await completeProgress(`✅ 已导入文章`, getNotionUrl(newPageId));
             }
             document.getElementById('caption').value = "";
             chrome.storage.local.remove('pending_caption');
@@ -1045,11 +1198,11 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             const { spaceId, isDatabase, collectionId, schema } = pageInfo;
 
             if (isDatabase && collectionId) {
-                await createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, manualCaption);
-                await completeProgress(`✅ 已导入至 Database（${threadData.tweets.length} 条推文）`);
+                const newPageId = await createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, manualCaption);
+                await completeProgress(`✅ 已导入至 Database（${threadData.tweets.length} 条推文）`, getNotionUrl(newPageId));
             } else {
-                await createNotionPageFromThread(spaceId, pageId, threadData, userId, manualCaption);
-                await completeProgress(`✅ 已导入 ${threadData.tweets.length} 条推文`);
+                const newPageId = await createNotionPageFromThread(spaceId, pageId, threadData, userId, manualCaption);
+                await completeProgress(`✅ 已导入 ${threadData.tweets.length} 条推文`, getNotionUrl(newPageId));
             }
             document.getElementById('caption').value = "";
             chrome.storage.local.remove('pending_caption');
@@ -1181,7 +1334,7 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             await new Promise(r => setTimeout(r, 800));
         }
 
-        await completeProgress(targets.length === 1 ? "✅ 导入完成" : `✅ 完成！导入 ${successCount} 个`);
+        await completeProgress(targets.length === 1 ? "✅ 导入完成" : `✅ 完成！导入 ${successCount} 个`, getNotionUrl(pageId));
 
         // 最终清理：如果全部成功（即没有失败的），清空
         if (failedUrls.length === 0) {
@@ -1469,6 +1622,8 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
                     properties: { source: [[block.url]] },
                     format: { display_source: block.url }
                 });
+            } else if (block.type === 'code') {
+                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
             } else if (block.type === 'video') {
                 addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
             }
@@ -1558,6 +1713,8 @@ async function createNotionPageFromThread(spaceId, parentId, threadData, userId,
                     properties: { source: [[block.url]] },
                     format: { display_source: block.url }
                 });
+            } else if (block.type === 'code') {
+                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
             } else if (block.type === 'video') {
                 addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
             }

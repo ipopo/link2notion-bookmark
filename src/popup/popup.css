@@ -364,3 +364,67 @@ button#btnImport:disabled {
     0%   { left: -30%; }
     100% { left: 100%; }
 }
+
+/* 成功弹窗：跳转按钮 */
+.notion-link-btn {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 10px 0;
+    width: 100%;
+    font-size: 14px;
+    font-weight: bold;
+    color: #fff;
+    background: #87BD09;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    text-decoration: none;
+    text-align: center;
+    transition: all 0.15s;
+}
+
+.notion-link-btn:hover {
+    background: #76A903;
+}
+
+.notion-link-btn:active {
+    transform: scale(0.97);
+}
+
+/* 成功弹窗：倒计时文字 */
+.countdown-text {
+    font-size: 11px;
+    color: #999;
+    margin-top: 6px;
+}
+
+/* 标签建议 */
+.tag-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.tag-chip {
+    padding: 3px 10px;
+    font-size: 11px;
+    color: #666;
+    background: #f0f0f0;
+    border: 1px solid #ddd;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+}
+
+.tag-chip:hover {
+    background: #e8e8e8;
+    border-color: #ccc;
+}
+
+.tag-chip.active {
+    color: #fff;
+    background: #87BD09;
+    border-color: #87BD09;
+}

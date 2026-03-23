@@ -2,6 +2,18 @@
 
 All notable changes to the **Notion 导入助手 (Notion Import Assistant)** project will be documented in this file.
 
+## [5.1.0] - 2026-03-21
+
+### Added
+- **导入成功跳转按钮**：保存完成后显示「在 Notion 中查看」全宽按钮，点击直接跳转到 Notion 中新创建的页面，3 秒倒计时后自动关闭。
+- **推文代码块导入**：支持提取 Twitter/X 推文中的 Markdown 代码块（`<pre><code>`），以 Notion Code Block 形式写入，保留语言标识。
+- **标签智能建议**：文章/推文模式下，从当前网页标题自动提取关键词（英文术语、短标题段），以可点击芯片形式展示，点击即填入标签输入框，支持切换选中。
+
+### Fixed
+- 修复推文中 `data-testid="markdown-code-block"` 代码块和内嵌文字被跳过未导入的问题。
+
+---
+
 ## [5.0.0] - 2026-03-13
 
 ### Changed
