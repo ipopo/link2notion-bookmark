@@ -147,8 +147,64 @@ async function extractXThread(tabId) {
                 return allSpans[0].parentElement;
             }
 
+            // 解析 X Article（原生长文）：twitterArticleReadView 结构
+            function extractTwitterArticleBlocks(article) {
+                const blocks = [];
+                const seenImgSrcs = new Set();
+
+                function pushImage(img) {
+                    if (!img) return;
+                    const src = (img.src || '').replace(/([?&]name=)\w+/, '$1large');
+                    if (src.startsWith('http') && !seenImgSrcs.has(src)) {
+                        seenImgSrcs.add(src);
+                        blocks.push({ type: 'image', url: src });
+                    }
+                }
+
+                // 标题由外层作为 Notion 页面标题，这里不再重复
+                const longform = article.querySelector('[data-testid="longformRichTextComponent"]');
+                const root = longform?.firstElementChild;
+                if (!root) return blocks;
+
+                for (const child of Array.from(root.children)) {
+                    const tag = child.tagName;
+                    if (tag === 'SECTION') {
+                        child.querySelectorAll('[data-testid="tweetPhoto"] img').forEach(pushImage);
+                        const directImg = child.querySelector(':scope > img');
+                        if (directImg) pushImage(directImg);
+                    } else if (tag === 'BLOCKQUOTE') {
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: 'quote', richText: rt.length ? rt : [[pt]], plainText: pt });
+                    } else if (tag === 'UL' || tag === 'OL') {
+                        const listType = tag === 'OL' ? 'numbered_list' : 'bulleted_list';
+                        for (const li of Array.from(child.querySelectorAll(':scope > li'))) {
+                            const rt = extractRichText(li);
+                            const pt = getPlainText(li);
+                            if (pt) blocks.push({ type: listType, richText: rt.length ? rt : [[pt]], plainText: pt });
+                        }
+                    } else if (tag === 'H1' || tag === 'H2' || tag === 'H3') {
+                        const level = tag === 'H1' ? 'header' : tag === 'H2' ? 'sub_header' : 'sub_sub_header';
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: level, richText: rt.length ? rt : [[pt]], plainText: pt });
+                    } else {
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: 'text', richText: rt.length ? rt : [[pt]], plainText: pt });
+                        child.querySelectorAll('[data-testid="tweetPhoto"] img').forEach(pushImage);
+                    }
+                }
+                return blocks;
+            }
+
             // 将一条推文解析为有序 blocks（text / image / video）
             function extractTweetBlocks(article) {
+                // 优先识别 X Article 原生长文
+                if (article.querySelector('[data-testid="twitterArticleReadView"]')) {
+                    return extractTwitterArticleBlocks(article);
+                }
+
                 const blocks = [];
                 const seenImgSrcs = new Set();
 
@@ -170,6 +226,42 @@ async function extractXThread(tabId) {
 
                 const textContainer = findTextContainer(article) ||
                     article.querySelector('[data-testid="tweetText"]');
+
+                // 长文推文：tweetText 内没有 span[data-text="true"]，直接按 \n\n 段落切分
+                const isLongPost = textContainer &&
+                    textContainer.getAttribute('data-testid') === 'tweetText' &&
+                    textContainer.querySelectorAll('span[data-text="true"]').length === 0;
+
+                if (isLongPost) {
+                    const raw = textContainer.textContent || '';
+                    const paragraphs = raw.split(/\n{2,}/).map(s => s.replace(/[ \t]+\n/g, '\n').trim()).filter(Boolean);
+                    for (const p of paragraphs) {
+                        blocks.push({ type: 'text', richText: [[p]], plainText: p });
+                    }
+
+                    // 仍然扫描文本容器后的兄弟节点（图片/代码块）
+                    let sibling = textContainer.nextElementSibling;
+                    while (sibling) {
+                        addImagesFromEl(sibling);
+                        const sibCodeBlock = sibling.querySelector('[data-testid="markdown-code-block"]') ||
+                            (sibling.getAttribute && sibling.getAttribute('data-testid') === 'markdown-code-block' ? sibling : null);
+                        if (sibCodeBlock) {
+                            const codeEl = sibCodeBlock.querySelector('pre code') || sibCodeBlock.querySelector('pre');
+                            if (codeEl) {
+                                const codeText = codeEl.textContent || '';
+                                const langMatch = ((sibCodeBlock.querySelector('code') || {}).className || '').match(/language-(\w+)/);
+                                const lang = langMatch ? langMatch[1] : '';
+                                blocks.push({ type: 'code', text: codeText, language: lang === 'text' ? 'Plain Text' : (lang || 'Plain Text') });
+                            }
+                        }
+                        sibling = sibling.nextElementSibling;
+                    }
+
+                    if (article.querySelector('[data-testid="videoPlayer"], [data-testid="videoComponent"]')) {
+                        blocks.push({ type: 'video' });
+                    }
+                    return blocks;
+                }
 
                 if (textContainer) {
                     // 遍历文本容器的直接子节点，按 DOM 顺序生成 text/image blocks
@@ -309,8 +401,10 @@ async function extractXThread(tabId) {
                 tweets.push({ blocks });
             }
 
-            // 使用浏览器 tab 实际标题（去除未读消息数前缀），与网页头部展示一致
-            const pageTitle = document.title.replace(/^\(\d+\)\s*/, '').trim();
+            // X Article 优先使用原生长文标题；否则用浏览器 tab 标题（去除未读消息数前缀）
+            const articleTitleEl = firstArticle.querySelector('[data-testid="twitter-article-title"]');
+            const articleTitle = (articleTitleEl?.textContent || '').trim();
+            const pageTitle = articleTitle || document.title.replace(/^\(\d+\)\s*/, '').trim();
 
             // 兜底：若 document.title 为空，则用作者名 + 推文首句
             const cardTitle = findCardTitle(firstArticle);
@@ -1184,9 +1278,10 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 
             // 显示提取摘要
             const blocks0 = threadData.tweets[0]?.blocks || [];
-            const textBlocks = blocks0.filter(b => b.type === 'text').length;
+            const richTypes = new Set(['text', 'header', 'sub_header', 'sub_sub_header', 'quote', 'bulleted_list', 'numbered_list']);
+            const textBlocks = blocks0.filter(b => richTypes.has(b.type)).length;
             const imgBlocks = blocks0.filter(b => b.type === 'image').length;
-            const preview = blocks0.find(b => b.type === 'text')?.plainText?.slice(0, 25) || '(空)';
+            const preview = blocks0.find(b => richTypes.has(b.type))?.plainText?.slice(0, 25) || '(空)';
             updateProgressText(`${threadData.tweets.length}条 | 段落:${textBlocks} 图:${imgBlocks} | "${preview}"`);
             await new Promise(r => setTimeout(r, 3000));
 
@@ -1646,21 +1741,7 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     for (let i = 0; i < threadData.tweets.length; i++) {
         const tweet = threadData.tweets[i];
         for (const block of (tweet.blocks || [])) {
-            if (block.type === 'text') {
-                const notionBlocks = parseTextBlockToNotionBlocks(block);
-                for (const nb of notionBlocks) {
-                    addBlock(nb.notionType, { properties: { title: nb.richText } });
-                }
-            } else if (block.type === 'image') {
-                addBlock("image", {
-                    properties: { source: [[block.url]] },
-                    format: { display_source: block.url }
-                });
-            } else if (block.type === 'code') {
-                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
-            } else if (block.type === 'video') {
-                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
-            }
+            writeTweetBlockToNotion(block, addBlock);
         }
         if (i < threadData.tweets.length - 1) addBlock("divider", {});
     }
@@ -1673,6 +1754,28 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     const resText = await res.text();
     if (!res.ok) throw new Error("创建 Database 页面失败: " + resText.slice(0, 100));
     return pageId;
+}
+
+// === 将单个推文 block 写入 Notion 页面（统一 Database / 普通页面两处写入） ===
+function writeTweetBlockToNotion(block, addBlock) {
+    const richBlockTypes = ['header', 'sub_header', 'sub_sub_header', 'quote', 'bulleted_list', 'numbered_list'];
+    if (block.type === 'text') {
+        const notionBlocks = parseTextBlockToNotionBlocks(block);
+        for (const nb of notionBlocks) {
+            addBlock(nb.notionType, { properties: { title: nb.richText } });
+        }
+    } else if (richBlockTypes.includes(block.type)) {
+        addBlock(block.type, { properties: { title: block.richText || [[block.plainText || '']] } });
+    } else if (block.type === 'image') {
+        addBlock("image", {
+            properties: { source: [[block.url]] },
+            format: { display_source: block.url }
+        });
+    } else if (block.type === 'code') {
+        addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
+    } else if (block.type === 'video') {
+        addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
+    }
 }
 
 // === 推文线程 → 独立 Notion 页面 ===
@@ -1737,21 +1840,7 @@ async function createNotionPageFromThread(spaceId, parentId, threadData, userId,
     for (let i = 0; i < threadData.tweets.length; i++) {
         const tweet = threadData.tweets[i];
         for (const block of (tweet.blocks || [])) {
-            if (block.type === 'text') {
-                const notionBlocks = parseTextBlockToNotionBlocks(block);
-                for (const nb of notionBlocks) {
-                    addBlock(nb.notionType, { properties: { title: nb.richText } });
-                }
-            } else if (block.type === 'image') {
-                addBlock("image", {
-                    properties: { source: [[block.url]] },
-                    format: { display_source: block.url }
-                });
-            } else if (block.type === 'code') {
-                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
-            } else if (block.type === 'video') {
-                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
-            }
+            writeTweetBlockToNotion(block, addBlock);
         }
         if (i < threadData.tweets.length - 1) {
             addBlock("divider", {});
