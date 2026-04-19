@@ -1507,10 +1507,39 @@ async function getPageInfo(pageId, userId) {
 
     let schema = null;
     if (collectionId && data.recordMap?.collection?.[collectionId]) {
-        schema = data.recordMap.collection[collectionId].value?.schema || null;
+        const entry = data.recordMap.collection[collectionId];
+        schema = entry.value?.value?.schema || entry.value?.schema || null;
+    }
+    // loadPageChunk 在新版 Notion 常不返回 collection 记录；兜底单独请求一次
+    if (collectionId && !schema) {
+        schema = await loadCollectionSchema(collectionId, spaceId, userId);
+    }
+
+    if (isDatabase) {
+        const fields = schema ? Object.entries(schema).map(([k, v]) => `${v.name}(${v.type})`) : [];
+        console.log("[link2notion] Database schema 字段:", fields.length ? fields : "(未读取到 schema)");
     }
 
     return { spaceId, isDatabase, collectionId, schema };
+}
+
+async function loadCollectionSchema(collectionId, spaceId, userId) {
+    try {
+        const res = await fetch("https://www.notion.so/api/v3/syncRecordValues", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
+            body: JSON.stringify({
+                requests: [{ pointer: { table: "collection", id: collectionId }, version: -1 }]
+            })
+        });
+        const data = await res.json();
+        const entry = data.recordMap?.collection?.[collectionId];
+        // 新版 Notion 响应多包一层 { value, role }，兼容两种结构
+        return entry?.value?.value?.schema || entry?.value?.schema || null;
+    } catch (e) {
+        console.warn("[link2notion] loadCollectionSchema 失败:", e);
+        return null;
+    }
 }
 
 async function getSpaceIdViaLoadChunk(pageId, userId) {
@@ -1622,20 +1651,16 @@ function parseTextBlockToNotionBlocks(block) {
         .map(({ text, rt }) => parseLineToNotionBlock(text, rt));
 }
 
-// === 辅助：在 Database schema 中查找匹配属性，找不到则规划新建 ===
-function findOrPlanSchemaKey(schema, names, type) {
-    if (schema) {
-        for (const [key, prop] of Object.entries(schema)) {
-            if (key === 'title') continue;
-            if (names.some(n => prop.name?.toLowerCase() === n.toLowerCase()) && prop.type === type) {
-                return { key, create: false, name: prop.name, type: prop.type };
-            }
+// === 辅助：在 Database schema 中按名称+类型查找已存在的属性，找不到返回 null（不会新建）===
+function findSchemaKey(schema, names, type) {
+    if (!schema) return null;
+    for (const [key, prop] of Object.entries(schema)) {
+        if (key === 'title') continue;
+        if (names.some(n => prop.name?.toLowerCase() === n.toLowerCase()) && prop.type === type) {
+            return { key, name: prop.name, type: prop.type };
         }
     }
-    // Notion schema key 惯用 4 位随机串
-    let key;
-    do { key = Math.random().toString(36).slice(2, 6); } while (schema && schema[key]);
-    return { key, create: true, name: names[0], type };
+    return null;
 }
 
 // === 推文线程 → Notion Database 页面 ===
@@ -1643,21 +1668,21 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     const pageId = uuidv4();
     const operations = [];
 
-    // 查找或规划属性的 schema key
-    const authorProp = findOrPlanSchemaKey(schema, ['Author', '作者'], 'text');
-    const urlProp    = findOrPlanSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
-    const dateProp   = findOrPlanSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
-    const tagsProp   = findOrPlanSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
+    // 只写入已存在的属性，缺失的字段跳过（不再自动新建 schema 属性）
+    const authorKey = findSchemaKey(schema, ['Author', '作者'], 'text');
+    const urlKey    = findSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
+    const dateKey   = findSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
+    const tagsKey   = findSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
 
-    // 处理 tags 的 schema 属性
+    // 处理 tags：仅在 tags 属性存在时写入，新增选项需更新 options
     let finalTagsStr = null;
-    if (tags && tags.trim()) {
+    if (tagsKey && tags && tags.trim()) {
         const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
-        const existingOptions = (!tagsProp.create && schema && schema[tagsProp.key] && schema[tagsProp.key].options) ? schema[tagsProp.key].options : [];
+        const existingOptions = schema[tagsKey.key].options || [];
         const existingValues = existingOptions.map(o => o.value);
-        let newOptions = [...existingOptions];
+        const newOptions = [...existingOptions];
         let hasNew = false;
-        
+
         for (const t of inputTags) {
             if (!existingValues.includes(t)) {
                 newOptions.push({
@@ -1668,42 +1693,23 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
                 hasNew = true;
             }
         }
-        
-        if (hasNew) {
-            tagsProp.create = true;
-            tagsProp.updatedOptions = newOptions;
-        } else if (tagsProp.create) {
-            tagsProp.updatedOptions = [];
-        }
-        
-        if (inputTags.length > 0) {
-            finalTagsStr = inputTags.join(',');
-        }
-    } else if (tagsProp.create) {
-        tagsProp.updatedOptions = [];
-    }
 
-    // 如需新建属性，先写入 collection schema
-    for (const prop of [authorProp, urlProp, dateProp, tagsProp]) {
-        if (prop.create) {
-            const args = { name: prop.name, type: prop.type };
-            if (prop.type === 'multi_select' && prop.updatedOptions) {
-                args.options = prop.updatedOptions;
-            }
+        if (hasNew) {
             operations.push({
                 id: collectionId, table: "collection",
-                path: ["schema", prop.key], command: "update",
-                args: args
+                path: ["schema", tagsKey.key], command: "update",
+                args: { name: tagsKey.name, type: tagsKey.type, options: newOptions }
             });
         }
+        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
     }
 
-    // 构建 properties
+    // 构建 properties（只写命中的属性）
     const properties = { title: [[threadData.title || "推文"]] };
-    if (threadData.authorName) properties[authorProp.key] = [[threadData.authorName]];
-    if (threadData.url)        properties[urlProp.key]    = [[threadData.url]];
-    if (threadData.dateISO)    properties[dateProp.key]   = [['‣', [['d', { type: 'date', start_date: threadData.dateISO }]]]];
-    if (finalTagsStr)          properties[tagsProp.key]   = [[finalTagsStr]];
+    if (authorKey && threadData.authorName) properties[authorKey.key] = [[threadData.authorName]];
+    if (urlKey && threadData.url)           properties[urlKey.key]   = [[threadData.url]];
+    if (dateKey && threadData.dateISO)      properties[dateKey.key]  = [['‣', [['d', { type: 'date', start_date: threadData.dateISO }]]]];
+    if (tagsKey && finalTagsStr)            properties[tagsKey.key]  = [[finalTagsStr]];
 
     const format = {};
 
@@ -1862,19 +1868,19 @@ async function createDatabasePageFromArticle(spaceId, collectionId, schema, arti
     const pageId = uuidv4();
     const operations = [];
 
-    // 查找或规划属性的 schema key（复用推文的逻辑）
-    const authorProp = findOrPlanSchemaKey(schema, ['Author', '作者', '来源'], 'text');
-    const urlProp    = findOrPlanSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
-    const dateProp   = findOrPlanSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
-    const tagsProp   = findOrPlanSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
+    // 只写入已存在的属性，缺失的字段跳过（不再自动新建 schema 属性）
+    const authorKey = findSchemaKey(schema, ['Author', '作者', '来源'], 'text');
+    const urlKey    = findSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
+    const dateKey   = findSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
+    const tagsKey   = findSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
 
-    // 处理 tags 的 schema 属性（与推文模式相同）
+    // 处理 tags：仅在 tags 属性存在时写入，新增选项需更新 options
     let finalTagsStr = null;
-    if (tags && tags.trim()) {
+    if (tagsKey && tags && tags.trim()) {
         const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
-        const existingOptions = (!tagsProp.create && schema && schema[tagsProp.key] && schema[tagsProp.key].options) ? schema[tagsProp.key].options : [];
+        const existingOptions = schema[tagsKey.key].options || [];
         const existingValues = existingOptions.map(o => o.value);
-        let newOptions = [...existingOptions];
+        const newOptions = [...existingOptions];
         let hasNew = false;
 
         for (const t of inputTags) {
@@ -1889,37 +1895,22 @@ async function createDatabasePageFromArticle(spaceId, collectionId, schema, arti
         }
 
         if (hasNew) {
-            tagsProp.create = true;
-            tagsProp.updatedOptions = newOptions;
-        } else if (tagsProp.create) {
-            tagsProp.updatedOptions = [];
-        }
-
-        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
-    } else if (tagsProp.create) {
-        tagsProp.updatedOptions = [];
-    }
-
-    // 新建属性写入 collection schema
-    for (const prop of [authorProp, urlProp, dateProp, tagsProp]) {
-        if (prop.create) {
-            const args = { name: prop.name, type: prop.type };
-            if (prop.type === 'multi_select' && prop.updatedOptions) args.options = prop.updatedOptions;
             operations.push({
                 id: collectionId, table: "collection",
-                path: ["schema", prop.key], command: "update",
-                args
+                path: ["schema", tagsKey.key], command: "update",
+                args: { name: tagsKey.name, type: tagsKey.type, options: newOptions }
             });
         }
+        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
     }
 
-    // 构建 properties
+    // 构建 properties（只写命中的属性）
     const authorLabel = articleData.authorName || articleData.siteName || '';
     const properties = { title: [[articleData.title || "文章"]] };
-    if (authorLabel)         properties[authorProp.key] = [[authorLabel]];
-    if (articleData.url)     properties[urlProp.key]    = [[articleData.url]];
-    if (articleData.dateISO) properties[dateProp.key]   = [['‣', [['d', { type: 'date', start_date: articleData.dateISO }]]]];
-    if (finalTagsStr)        properties[tagsProp.key]   = [[finalTagsStr]];
+    if (authorKey && authorLabel)           properties[authorKey.key] = [[authorLabel]];
+    if (urlKey && articleData.url)          properties[urlKey.key]    = [[articleData.url]];
+    if (dateKey && articleData.dateISO)     properties[dateKey.key]   = [['‣', [['d', { type: 'date', start_date: articleData.dateISO }]]]];
+    if (tagsKey && finalTagsStr)            properties[tagsKey.key]   = [[finalTagsStr]];
 
     // 创建 Database 页
     operations.push({
