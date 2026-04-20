@@ -147,8 +147,64 @@ async function extractXThread(tabId) {
                 return allSpans[0].parentElement;
             }
 
+            // 解析 X Article（原生长文）：twitterArticleReadView 结构
+            function extractTwitterArticleBlocks(article) {
+                const blocks = [];
+                const seenImgSrcs = new Set();
+
+                function pushImage(img) {
+                    if (!img) return;
+                    const src = (img.src || '').replace(/([?&]name=)\w+/, '$1large');
+                    if (src.startsWith('http') && !seenImgSrcs.has(src)) {
+                        seenImgSrcs.add(src);
+                        blocks.push({ type: 'image', url: src });
+                    }
+                }
+
+                // 标题由外层作为 Notion 页面标题，这里不再重复
+                const longform = article.querySelector('[data-testid="longformRichTextComponent"]');
+                const root = longform?.firstElementChild;
+                if (!root) return blocks;
+
+                for (const child of Array.from(root.children)) {
+                    const tag = child.tagName;
+                    if (tag === 'SECTION') {
+                        child.querySelectorAll('[data-testid="tweetPhoto"] img').forEach(pushImage);
+                        const directImg = child.querySelector(':scope > img');
+                        if (directImg) pushImage(directImg);
+                    } else if (tag === 'BLOCKQUOTE') {
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: 'quote', richText: rt.length ? rt : [[pt]], plainText: pt });
+                    } else if (tag === 'UL' || tag === 'OL') {
+                        const listType = tag === 'OL' ? 'numbered_list' : 'bulleted_list';
+                        for (const li of Array.from(child.querySelectorAll(':scope > li'))) {
+                            const rt = extractRichText(li);
+                            const pt = getPlainText(li);
+                            if (pt) blocks.push({ type: listType, richText: rt.length ? rt : [[pt]], plainText: pt });
+                        }
+                    } else if (tag === 'H1' || tag === 'H2' || tag === 'H3') {
+                        const level = tag === 'H1' ? 'header' : tag === 'H2' ? 'sub_header' : 'sub_sub_header';
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: level, richText: rt.length ? rt : [[pt]], plainText: pt });
+                    } else {
+                        const rt = extractRichText(child);
+                        const pt = getPlainText(child);
+                        if (pt) blocks.push({ type: 'text', richText: rt.length ? rt : [[pt]], plainText: pt });
+                        child.querySelectorAll('[data-testid="tweetPhoto"] img').forEach(pushImage);
+                    }
+                }
+                return blocks;
+            }
+
             // 将一条推文解析为有序 blocks（text / image / video）
             function extractTweetBlocks(article) {
+                // 优先识别 X Article 原生长文
+                if (article.querySelector('[data-testid="twitterArticleReadView"]')) {
+                    return extractTwitterArticleBlocks(article);
+                }
+
                 const blocks = [];
                 const seenImgSrcs = new Set();
 
@@ -170,6 +226,42 @@ async function extractXThread(tabId) {
 
                 const textContainer = findTextContainer(article) ||
                     article.querySelector('[data-testid="tweetText"]');
+
+                // 长文推文：tweetText 内没有 span[data-text="true"]，直接按 \n\n 段落切分
+                const isLongPost = textContainer &&
+                    textContainer.getAttribute('data-testid') === 'tweetText' &&
+                    textContainer.querySelectorAll('span[data-text="true"]').length === 0;
+
+                if (isLongPost) {
+                    const raw = textContainer.textContent || '';
+                    const paragraphs = raw.split(/\n{2,}/).map(s => s.replace(/[ \t]+\n/g, '\n').trim()).filter(Boolean);
+                    for (const p of paragraphs) {
+                        blocks.push({ type: 'text', richText: [[p]], plainText: p });
+                    }
+
+                    // 仍然扫描文本容器后的兄弟节点（图片/代码块）
+                    let sibling = textContainer.nextElementSibling;
+                    while (sibling) {
+                        addImagesFromEl(sibling);
+                        const sibCodeBlock = sibling.querySelector('[data-testid="markdown-code-block"]') ||
+                            (sibling.getAttribute && sibling.getAttribute('data-testid') === 'markdown-code-block' ? sibling : null);
+                        if (sibCodeBlock) {
+                            const codeEl = sibCodeBlock.querySelector('pre code') || sibCodeBlock.querySelector('pre');
+                            if (codeEl) {
+                                const codeText = codeEl.textContent || '';
+                                const langMatch = ((sibCodeBlock.querySelector('code') || {}).className || '').match(/language-(\w+)/);
+                                const lang = langMatch ? langMatch[1] : '';
+                                blocks.push({ type: 'code', text: codeText, language: lang === 'text' ? 'Plain Text' : (lang || 'Plain Text') });
+                            }
+                        }
+                        sibling = sibling.nextElementSibling;
+                    }
+
+                    if (article.querySelector('[data-testid="videoPlayer"], [data-testid="videoComponent"]')) {
+                        blocks.push({ type: 'video' });
+                    }
+                    return blocks;
+                }
 
                 if (textContainer) {
                     // 遍历文本容器的直接子节点，按 DOM 顺序生成 text/image blocks
@@ -309,8 +401,10 @@ async function extractXThread(tabId) {
                 tweets.push({ blocks });
             }
 
-            // 使用浏览器 tab 实际标题（去除未读消息数前缀），与网页头部展示一致
-            const pageTitle = document.title.replace(/^\(\d+\)\s*/, '').trim();
+            // X Article 优先使用原生长文标题；否则用浏览器 tab 标题（去除未读消息数前缀）
+            const articleTitleEl = firstArticle.querySelector('[data-testid="twitter-article-title"]');
+            const articleTitle = (articleTitleEl?.textContent || '').trim();
+            const pageTitle = articleTitle || document.title.replace(/^\(\d+\)\s*/, '').trim();
 
             // 兜底：若 document.title 为空，则用作者名 + 推文首句
             const cardTitle = findCardTitle(firstArticle);
@@ -1184,9 +1278,10 @@ document.getElementById('btnImport').addEventListener('click', async () => {
 
             // 显示提取摘要
             const blocks0 = threadData.tweets[0]?.blocks || [];
-            const textBlocks = blocks0.filter(b => b.type === 'text').length;
+            const richTypes = new Set(['text', 'header', 'sub_header', 'sub_sub_header', 'quote', 'bulleted_list', 'numbered_list']);
+            const textBlocks = blocks0.filter(b => richTypes.has(b.type)).length;
             const imgBlocks = blocks0.filter(b => b.type === 'image').length;
-            const preview = blocks0.find(b => b.type === 'text')?.plainText?.slice(0, 25) || '(空)';
+            const preview = blocks0.find(b => richTypes.has(b.type))?.plainText?.slice(0, 25) || '(空)';
             updateProgressText(`${threadData.tweets.length}条 | 段落:${textBlocks} 图:${imgBlocks} | "${preview}"`);
             await new Promise(r => setTimeout(r, 3000));
 
@@ -1372,16 +1467,79 @@ async function getPageInfo(pageId, userId) {
     const blockData = data.recordMap?.block?.[pageId];
     if (!blockData?.value) throw new Error("无法读取页面信息，请检查 ID");
 
-    const spaceId = blockData.value.space_id;
-    const isDatabase = ['collection_view_page', 'collection_view'].includes(blockData.value.type);
-    const collectionId = blockData.value.collection_id || null;
+    const val = blockData.value;
+
+    // spaceId 兜底：当前块可能缺失，从 recordMap 中其他块或 space 获取
+    let spaceId = val.space_id;
+    if (!spaceId) {
+        const blocks = data.recordMap?.block || {};
+        for (const bid of Object.keys(blocks)) {
+            if (blocks[bid]?.value?.space_id) { spaceId = blocks[bid].value.space_id; break; }
+        }
+    }
+    if (!spaceId) {
+        const spaces = data.recordMap?.space || {};
+        const firstSpace = Object.keys(spaces)[0];
+        if (firstSpace) spaceId = firstSpace;
+    }
+
+    // Database 检测：block 自身类型 或 parent_table 为 collection（数据库行）
+    const blockType = val.type;
+    const parentTable = val.parent_table;
+    let isDatabase = ['collection_view_page', 'collection_view'].includes(blockType);
+    let collectionId = val.collection_id || null;
+
+    // 数据库行（page 类型但 parent_table 是 collection）也视为 Database
+    if (!isDatabase && blockType === 'page' && parentTable === 'collection') {
+        isDatabase = true;
+        collectionId = val.parent_id || null;
+    }
+
+    // 最后兜底：如果 recordMap 中有 collection 数据，说明这就是个 Database
+    if (!isDatabase && !collectionId) {
+        const collections = data.recordMap?.collection || {};
+        const firstColl = Object.keys(collections)[0];
+        if (firstColl) {
+            isDatabase = true;
+            collectionId = firstColl;
+        }
+    }
 
     let schema = null;
     if (collectionId && data.recordMap?.collection?.[collectionId]) {
-        schema = data.recordMap.collection[collectionId].value?.schema || null;
+        const entry = data.recordMap.collection[collectionId];
+        schema = entry.value?.value?.schema || entry.value?.schema || null;
+    }
+    // loadPageChunk 在新版 Notion 常不返回 collection 记录；兜底单独请求一次
+    if (collectionId && !schema) {
+        schema = await loadCollectionSchema(collectionId, spaceId, userId);
+    }
+
+    if (isDatabase) {
+        const fields = schema ? Object.entries(schema).map(([k, v]) => `${v.name}(${v.type})`) : [];
+        console.log("[link2notion] Database schema 字段:", fields.length ? fields : "(未读取到 schema)");
     }
 
     return { spaceId, isDatabase, collectionId, schema };
+}
+
+async function loadCollectionSchema(collectionId, spaceId, userId) {
+    try {
+        const res = await fetch("https://www.notion.so/api/v3/syncRecordValues", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
+            body: JSON.stringify({
+                requests: [{ pointer: { table: "collection", id: collectionId }, version: -1 }]
+            })
+        });
+        const data = await res.json();
+        const entry = data.recordMap?.collection?.[collectionId];
+        // 新版 Notion 响应多包一层 { value, role }，兼容两种结构
+        return entry?.value?.value?.schema || entry?.value?.schema || null;
+    } catch (e) {
+        console.warn("[link2notion] loadCollectionSchema 失败:", e);
+        return null;
+    }
 }
 
 async function getSpaceIdViaLoadChunk(pageId, userId) {
@@ -1493,20 +1651,16 @@ function parseTextBlockToNotionBlocks(block) {
         .map(({ text, rt }) => parseLineToNotionBlock(text, rt));
 }
 
-// === 辅助：在 Database schema 中查找匹配属性，找不到则规划新建 ===
-function findOrPlanSchemaKey(schema, names, type) {
-    if (schema) {
-        for (const [key, prop] of Object.entries(schema)) {
-            if (key === 'title') continue;
-            if (names.some(n => prop.name?.toLowerCase() === n.toLowerCase()) && prop.type === type) {
-                return { key, create: false, name: prop.name, type: prop.type };
-            }
+// === 辅助：在 Database schema 中按名称+类型查找已存在的属性，找不到返回 null（不会新建）===
+function findSchemaKey(schema, names, type) {
+    if (!schema) return null;
+    for (const [key, prop] of Object.entries(schema)) {
+        if (key === 'title') continue;
+        if (names.some(n => prop.name?.toLowerCase() === n.toLowerCase()) && prop.type === type) {
+            return { key, name: prop.name, type: prop.type };
         }
     }
-    // Notion schema key 惯用 4 位随机串
-    let key;
-    do { key = Math.random().toString(36).slice(2, 6); } while (schema && schema[key]);
-    return { key, create: true, name: names[0], type };
+    return null;
 }
 
 // === 推文线程 → Notion Database 页面 ===
@@ -1514,21 +1668,21 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     const pageId = uuidv4();
     const operations = [];
 
-    // 查找或规划属性的 schema key
-    const authorProp = findOrPlanSchemaKey(schema, ['Author', '作者'], 'text');
-    const urlProp    = findOrPlanSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
-    const dateProp   = findOrPlanSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
-    const tagsProp   = findOrPlanSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
+    // 只写入已存在的属性，缺失的字段跳过（不再自动新建 schema 属性）
+    const authorKey = findSchemaKey(schema, ['Author', '作者'], 'text');
+    const urlKey    = findSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
+    const dateKey   = findSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
+    const tagsKey   = findSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
 
-    // 处理 tags 的 schema 属性
+    // 处理 tags：仅在 tags 属性存在时写入，新增选项需更新 options
     let finalTagsStr = null;
-    if (tags && tags.trim()) {
+    if (tagsKey && tags && tags.trim()) {
         const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
-        const existingOptions = (!tagsProp.create && schema && schema[tagsProp.key] && schema[tagsProp.key].options) ? schema[tagsProp.key].options : [];
+        const existingOptions = schema[tagsKey.key].options || [];
         const existingValues = existingOptions.map(o => o.value);
-        let newOptions = [...existingOptions];
+        const newOptions = [...existingOptions];
         let hasNew = false;
-        
+
         for (const t of inputTags) {
             if (!existingValues.includes(t)) {
                 newOptions.push({
@@ -1539,42 +1693,23 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
                 hasNew = true;
             }
         }
-        
-        if (hasNew) {
-            tagsProp.create = true;
-            tagsProp.updatedOptions = newOptions;
-        } else if (tagsProp.create) {
-            tagsProp.updatedOptions = [];
-        }
-        
-        if (inputTags.length > 0) {
-            finalTagsStr = inputTags.join(',');
-        }
-    } else if (tagsProp.create) {
-        tagsProp.updatedOptions = [];
-    }
 
-    // 如需新建属性，先写入 collection schema
-    for (const prop of [authorProp, urlProp, dateProp, tagsProp]) {
-        if (prop.create) {
-            const args = { name: prop.name, type: prop.type };
-            if (prop.type === 'multi_select' && prop.updatedOptions) {
-                args.options = prop.updatedOptions;
-            }
+        if (hasNew) {
             operations.push({
                 id: collectionId, table: "collection",
-                path: ["schema", prop.key], command: "update",
-                args: args
+                path: ["schema", tagsKey.key], command: "update",
+                args: { name: tagsKey.name, type: tagsKey.type, options: newOptions }
             });
         }
+        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
     }
 
-    // 构建 properties
+    // 构建 properties（只写命中的属性）
     const properties = { title: [[threadData.title || "推文"]] };
-    if (threadData.authorName) properties[authorProp.key] = [[threadData.authorName]];
-    if (threadData.url)        properties[urlProp.key]    = [[threadData.url]];
-    if (threadData.dateISO)    properties[dateProp.key]   = [['‣', [['d', { type: 'date', start_date: threadData.dateISO }]]]];
-    if (finalTagsStr)          properties[tagsProp.key]   = [[finalTagsStr]];
+    if (authorKey && threadData.authorName) properties[authorKey.key] = [[threadData.authorName]];
+    if (urlKey && threadData.url)           properties[urlKey.key]   = [[threadData.url]];
+    if (dateKey && threadData.dateISO)      properties[dateKey.key]  = [['‣', [['d', { type: 'date', start_date: threadData.dateISO }]]]];
+    if (tagsKey && finalTagsStr)            properties[tagsKey.key]  = [[finalTagsStr]];
 
     const format = {};
 
@@ -1612,21 +1747,7 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     for (let i = 0; i < threadData.tweets.length; i++) {
         const tweet = threadData.tweets[i];
         for (const block of (tweet.blocks || [])) {
-            if (block.type === 'text') {
-                const notionBlocks = parseTextBlockToNotionBlocks(block);
-                for (const nb of notionBlocks) {
-                    addBlock(nb.notionType, { properties: { title: nb.richText } });
-                }
-            } else if (block.type === 'image') {
-                addBlock("image", {
-                    properties: { source: [[block.url]] },
-                    format: { display_source: block.url }
-                });
-            } else if (block.type === 'code') {
-                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
-            } else if (block.type === 'video') {
-                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
-            }
+            writeTweetBlockToNotion(block, addBlock);
         }
         if (i < threadData.tweets.length - 1) addBlock("divider", {});
     }
@@ -1639,6 +1760,28 @@ async function createDatabasePageFromThread(spaceId, collectionId, schema, threa
     const resText = await res.text();
     if (!res.ok) throw new Error("创建 Database 页面失败: " + resText.slice(0, 100));
     return pageId;
+}
+
+// === 将单个推文 block 写入 Notion 页面（统一 Database / 普通页面两处写入） ===
+function writeTweetBlockToNotion(block, addBlock) {
+    const richBlockTypes = ['header', 'sub_header', 'sub_sub_header', 'quote', 'bulleted_list', 'numbered_list'];
+    if (block.type === 'text') {
+        const notionBlocks = parseTextBlockToNotionBlocks(block);
+        for (const nb of notionBlocks) {
+            addBlock(nb.notionType, { properties: { title: nb.richText } });
+        }
+    } else if (richBlockTypes.includes(block.type)) {
+        addBlock(block.type, { properties: { title: block.richText || [[block.plainText || '']] } });
+    } else if (block.type === 'image') {
+        addBlock("image", {
+            properties: { source: [[block.url]] },
+            format: { display_source: block.url }
+        });
+    } else if (block.type === 'code') {
+        addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
+    } else if (block.type === 'video') {
+        addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
+    }
 }
 
 // === 推文线程 → 独立 Notion 页面 ===
@@ -1703,21 +1846,7 @@ async function createNotionPageFromThread(spaceId, parentId, threadData, userId,
     for (let i = 0; i < threadData.tweets.length; i++) {
         const tweet = threadData.tweets[i];
         for (const block of (tweet.blocks || [])) {
-            if (block.type === 'text') {
-                const notionBlocks = parseTextBlockToNotionBlocks(block);
-                for (const nb of notionBlocks) {
-                    addBlock(nb.notionType, { properties: { title: nb.richText } });
-                }
-            } else if (block.type === 'image') {
-                addBlock("image", {
-                    properties: { source: [[block.url]] },
-                    format: { display_source: block.url }
-                });
-            } else if (block.type === 'code') {
-                addBlock("code", { properties: { title: [[block.text]], language: [[block.language || 'Plain Text']] } });
-            } else if (block.type === 'video') {
-                addBlock("text", { properties: { title: [["📹 [视频内容，请前往原链接查看]", [["i"]]]] } });
-            }
+            writeTweetBlockToNotion(block, addBlock);
         }
         if (i < threadData.tweets.length - 1) {
             addBlock("divider", {});
@@ -1739,19 +1868,19 @@ async function createDatabasePageFromArticle(spaceId, collectionId, schema, arti
     const pageId = uuidv4();
     const operations = [];
 
-    // 查找或规划属性的 schema key（复用推文的逻辑）
-    const authorProp = findOrPlanSchemaKey(schema, ['Author', '作者', '来源'], 'text');
-    const urlProp    = findOrPlanSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
-    const dateProp   = findOrPlanSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
-    const tagsProp   = findOrPlanSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
+    // 只写入已存在的属性，缺失的字段跳过（不再自动新建 schema 属性）
+    const authorKey = findSchemaKey(schema, ['Author', '作者', '来源'], 'text');
+    const urlKey    = findSchemaKey(schema, ['URL', '链接', 'Link'], 'url');
+    const dateKey   = findSchemaKey(schema, ['Date', '日期', '发布日期', '创建时间'], 'date');
+    const tagsKey   = findSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
 
-    // 处理 tags 的 schema 属性（与推文模式相同）
+    // 处理 tags：仅在 tags 属性存在时写入，新增选项需更新 options
     let finalTagsStr = null;
-    if (tags && tags.trim()) {
+    if (tagsKey && tags && tags.trim()) {
         const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
-        const existingOptions = (!tagsProp.create && schema && schema[tagsProp.key] && schema[tagsProp.key].options) ? schema[tagsProp.key].options : [];
+        const existingOptions = schema[tagsKey.key].options || [];
         const existingValues = existingOptions.map(o => o.value);
-        let newOptions = [...existingOptions];
+        const newOptions = [...existingOptions];
         let hasNew = false;
 
         for (const t of inputTags) {
@@ -1766,37 +1895,22 @@ async function createDatabasePageFromArticle(spaceId, collectionId, schema, arti
         }
 
         if (hasNew) {
-            tagsProp.create = true;
-            tagsProp.updatedOptions = newOptions;
-        } else if (tagsProp.create) {
-            tagsProp.updatedOptions = [];
-        }
-
-        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
-    } else if (tagsProp.create) {
-        tagsProp.updatedOptions = [];
-    }
-
-    // 新建属性写入 collection schema
-    for (const prop of [authorProp, urlProp, dateProp, tagsProp]) {
-        if (prop.create) {
-            const args = { name: prop.name, type: prop.type };
-            if (prop.type === 'multi_select' && prop.updatedOptions) args.options = prop.updatedOptions;
             operations.push({
                 id: collectionId, table: "collection",
-                path: ["schema", prop.key], command: "update",
-                args
+                path: ["schema", tagsKey.key], command: "update",
+                args: { name: tagsKey.name, type: tagsKey.type, options: newOptions }
             });
         }
+        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
     }
 
-    // 构建 properties
+    // 构建 properties（只写命中的属性）
     const authorLabel = articleData.authorName || articleData.siteName || '';
     const properties = { title: [[articleData.title || "文章"]] };
-    if (authorLabel)         properties[authorProp.key] = [[authorLabel]];
-    if (articleData.url)     properties[urlProp.key]    = [[articleData.url]];
-    if (articleData.dateISO) properties[dateProp.key]   = [['‣', [['d', { type: 'date', start_date: articleData.dateISO }]]]];
-    if (finalTagsStr)        properties[tagsProp.key]   = [[finalTagsStr]];
+    if (authorKey && authorLabel)           properties[authorKey.key] = [[authorLabel]];
+    if (urlKey && articleData.url)          properties[urlKey.key]    = [[articleData.url]];
+    if (dateKey && articleData.dateISO)     properties[dateKey.key]   = [['‣', [['d', { type: 'date', start_date: articleData.dateISO }]]]];
+    if (tagsKey && finalTagsStr)            properties[tagsKey.key]   = [[finalTagsStr]];
 
     // 创建 Database 页
     operations.push({
