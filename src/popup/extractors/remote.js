@@ -1,8 +1,17 @@
 // 方案A：远程爬虫（用于批量链接模式，非当前标签页）
 
 import { cleanTitle, filterCover } from '../utils/url.js';
+import { TWEET_STATUS_RE, fetchTweetMeta } from './tweet-syndication.js';
 
 export async function fetchRemoteMetadata(url) {
+    // X/Twitter 推文：短路到 syndication API，拿真实作者/正文/媒体图
+    // （x.com 对未登录 fetch 返回登录墙，og 数据无意义）
+    if (TWEET_STATUS_RE.test(url)) {
+        const tweetMeta = await fetchTweetMeta(url);
+        if (tweetMeta) return tweetMeta;
+        // syndication 失败 → 降级走下方通用流程
+    }
+
     const result = { title: null, description: null, cover: null, icon: null };
     try {
         const controller = new AbortController();

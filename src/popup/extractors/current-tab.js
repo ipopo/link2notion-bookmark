@@ -1,9 +1,16 @@
-// 方案B：直读当前标签页 DOM（专门解决 Twitter/SPA 等远程抓不到的页面）
+// 方案B：直读当前标签页 DOM（专门解决 SPA 等远程抓不到的页面）
+// 注意：X/Twitter 推文 /status/{id} 已由 syndication 短路接管，这里只处理非 status URL。
 
-import { cleanTitle } from '../utils/url.js';
+import { cleanTitle, filterCover } from '../utils/url.js';
 import { fetchRemoteMetadata } from './remote.js';
+import { TWEET_STATUS_RE } from './tweet-syndication.js';
 
 export async function extractCurrentTabMetadata(tabId, url) {
+    // X/Twitter 推文：跳过 DOM 提取，走 syndication（由 fetchRemoteMetadata 内部短路处理）
+    if (TWEET_STATUS_RE.test(url)) {
+        return await fetchRemoteMetadata(url);
+    }
+
     try {
         const results = await chrome.scripting.executeScript({
             target: { tabId: tabId },
@@ -15,7 +22,6 @@ export async function extractCurrentTabMetadata(tabId, url) {
                     title: document.title || getMeta('og:title'),
                     description: getMeta('og:description') || getName('description') || "",
                     cover: getMeta('og:image') || "",
-                    twitterText: document.querySelector('article div[lang]')?.innerText
                 };
 
                 if (window.location.hostname.includes('youtube.com') || window.location.hostname.includes('youtu.be')) {
@@ -46,22 +52,9 @@ export async function extractCurrentTabMetadata(tabId, url) {
                 data.icon = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
             } catch (e) { }
 
-            if (!data.description && data.twitterText) {
-                data.description = data.twitterText.slice(0, 200);
-            }
-
-            data.cover = (() => {
-                if (url.includes('x.com') ||
-                    url.includes('twitter.com') ||
-                    url.includes('youtube.com') ||
-                    url.includes('youtu.be') ||
-                    url.includes('bilibili.com')) {
-                    return null;
-                }
-                return data.cover;
-            })();
-
-            // 清理标题（移除 X/Twitter 未读消息数前缀）
+            data.cover = filterCover(url, data.cover);
+            // 非 status 的 X URL（profile/home）仍走 DOM 提取，document.title 可能带
+            // "(3) " 未读消息数前缀，需清洗。
             data.title = cleanTitle(url, data.title);
 
             return data;

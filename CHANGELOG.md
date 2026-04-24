@@ -2,6 +2,14 @@
 
 All notable changes to the **Notion 导入助手 (Notion Import Assistant)** project will be documented in this file.
 
+## [5.2.2] - 2026-04-24
+
+### Internal
+- **`popup.js` ESM 模块化重构**：将原 2100+ 行 monolithic `popup.js` 拆分为 20 个 ESM 模块，按职责分组到 `extractors/` `notion/` `parsers/` `ui/` `utils/` 五个目录；入口 `popup.js` 仅保留两行 `import`。重构遵循"行为零变更、模块边界清晰"原则，详见 `REFACTOR_LOG.md`。
+- **syndication 抽为独立模块**：v5.2.1 的推文 syndication 抓取逻辑（`TWEET_STATUS_RE` / `_tweetMetaCache` / `fetchTweetMeta`）抽离到 `extractors/tweet-syndication.js`，与 `extractors/remote.js`、`extractors/current-tab.js` 解耦；功能与 v5.2.1 等价，仅结构变化。
+
+---
+
 ## [5.2.1] - 2026-04-24
 
 ### Added
