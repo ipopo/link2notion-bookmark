@@ -2,6 +2,21 @@
 
 All notable changes to the **Notion 导入助手 (Notion Import Assistant)** project will be documented in this file.
 
+## [5.2.1] - 2026-04-24
+
+### Added
+- **推文 Bookmark 真实封面与完整数据**：书签 / 批量模式下导入 `x.com/*/status/*` 推文链接时，改走官方 syndication API（`cdn.syndication.twimg.com/tweet-result`）抓取，拿到真实推文媒体图（photo 首图 / video poster）作为 bookmark 封面，并同时取出"作者 on X: 正文摘要"标题和完整推文正文作为描述。此前 og:image 对所有推文都是同一张通用默认图（被黑名单过滤为无封面）、批量模式 `fetch(x.com)` 还会撞登录墙导致标题仅剩 "X"，现已根除。
+
+### Changed
+- **"在 Notion 中查看"按钮样式**：由实心绿色主按钮改为浅绿描边风格，与"导入样式"单选按钮选中态视觉一致，降低完成弹层的视觉重量。
+- **Popup 底部间距收紧**：`body` 下内边距与 `#status` 外边距调整，空态下底部空白由 43px 减至 34px，避免视觉松散。
+
+### Internal
+- 会话级推文元数据缓存（`_tweetMetaCache`）：UI 预检与正式导入共用缓存，同一推文在 popup 存活期间只调用一次 syndication。
+- 整理封面过滤逻辑中的重复实现，`extractCurrentTabMetadata` 内联黑名单统一回 `filterCover`；推文 URL 走 syndication 短路不再经过 `filterCover`，非推文 X URL（主页 / profile）仍由 `filterCover` 屏蔽 X 通用默认图。
+
+---
+
 ## [5.1.0] - 2026-03-21
 
 ### Added

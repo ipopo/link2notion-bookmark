@@ -26,6 +26,10 @@ function getCurrentUserId() {
 }
 
 // === 辅助函数：特定平台封面过滤器 ===
+// 这些平台的 og:image 是通用默认图，无价值：
+// - YouTube/Bilibili：站点/频道 logo
+// - x.com/twitter.com 个人主页：X 默认图
+// 注意：X 推文 /status/{id} URL 走 syndication 短路，不经过这里。
 function filterCover(url, coverUrl) {
     if (url.includes('x.com') ||
         url.includes('twitter.com') ||
@@ -35,6 +39,56 @@ function filterCover(url, coverUrl) {
         return null;
     }
     return coverUrl;
+}
+
+// === 辅助函数：X/Twitter 推文元数据抓取 ===
+// X 页面的 og:title/image 对所有推文都是同一张默认图 / 通用标题，无价值；
+// 批量模式下 fetch(x.com) 还会撞上登录墙。改走官方 syndication API
+// （cdn.syndication.twimg.com），拿到真实作者、正文与媒体图。
+// 注意：仅针对推文 /status/{id} 链接短路；X 主页 / profile 等非 status URL 仍走通用流程。
+const TWEET_STATUS_RE = /^https?:\/\/(?:x|twitter|vxtwitter|fxtwitter)\.com\/[^/]+\/status\/(\d+)/i;
+
+// 会话级缓存：同一 statusId 在 popup 存活期间只请求一次 syndication
+const _tweetMetaCache = new Map();
+
+async function fetchTweetMeta(url) {
+    const m = url.match(TWEET_STATUS_RE);
+    if (!m) return null;
+    const statusId = m[1];
+    if (_tweetMetaCache.has(statusId)) return _tweetMetaCache.get(statusId);
+
+    let meta = null;
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const res = await fetch(
+            `https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=a`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeoutId);
+        if (res.ok) {
+            const data = await res.json();
+            const user = data.user || {};
+            const authorName = user.name || user.screen_name || 'Unknown';
+            // 清洗文末 t.co 短链（通常指向自带媒体，对摘要无价值）
+            const text = (data.text || '').replace(/\s*https?:\/\/t\.co\/\S+/g, '').trim();
+            const cover = data.mediaDetails?.[0]?.media_url_https || null;
+            const title = text
+                ? `${authorName} on X: ${text.slice(0, 80)}`.replace(/[…\s]+$/, '')
+                : `${authorName} on X`;
+            meta = {
+                title,
+                description: text,
+                cover,
+                icon: 'https://www.google.com/s2/favicons?domain=x.com&sz=64',
+            };
+        }
+    } catch (e) {
+        console.warn('[syndication] 获取推文数据失败:', e);
+    }
+
+    _tweetMetaCache.set(statusId, meta);
+    return meta;
 }
 
 // === 辅助函数：清理标题（移除 X/Twitter 未读消息数前缀）===
@@ -51,6 +105,14 @@ function cleanTitle(url, title) {
 
 // === 方案A：远程爬虫 (用于批量链接) ===
 async function fetchRemoteMetadata(url) {
+    // X/Twitter 推文: 短路到 syndication API，拿真实作者/正文/媒体图
+    // （x.com 对未登录 fetch 返回登录墙，og 数据无意义）
+    if (TWEET_STATUS_RE.test(url)) {
+        const tweetMeta = await fetchTweetMeta(url);
+        if (tweetMeta) return tweetMeta;
+        // syndication 失败 → 降级走下方通用流程
+    }
+
     const result = { title: null, description: null, cover: null, icon: null };
     try {
         const controller = new AbortController();
@@ -688,8 +750,13 @@ function htmlToNotionBlocks(html, baseUrl) {
     });
 }
 
-// === 方案B：当前页直读 (专门解决 Twitter/SPA) ===
+// === 方案B：当前页直读 ===
 async function extractCurrentTabMetadata(tabId, url) {
+    // X/Twitter 推文: 跳过 DOM 提取，走 syndication（由 fetchRemoteMetadata 内部短路处理）
+    if (TWEET_STATUS_RE.test(url)) {
+        return await fetchRemoteMetadata(url);
+    }
+
     try {
         const results = await chrome.scripting.executeScript({
             target: { tabId: tabId },
@@ -701,7 +768,6 @@ async function extractCurrentTabMetadata(tabId, url) {
                     title: document.title || getMeta('og:title'),
                     description: getMeta('og:description') || getName('description') || "",
                     cover: getMeta('og:image') || "",
-                    twitterText: document.querySelector('article div[lang]')?.innerText
                 };
 
                 if (window.location.hostname.includes('youtube.com') || window.location.hostname.includes('youtu.be')) {
@@ -732,22 +798,9 @@ async function extractCurrentTabMetadata(tabId, url) {
                 data.icon = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
             } catch (e) { }
 
-            if (!data.description && data.twitterText) {
-                data.description = data.twitterText.slice(0, 200);
-            }
-
-            data.cover = (() => {
-                if (url.includes('x.com') ||
-                    url.includes('twitter.com') ||
-                    url.includes('youtube.com') ||
-                    url.includes('youtu.be') ||
-                    url.includes('bilibili.com')) {
-                    return null;
-                }
-                return data.cover;
-            })();
-
-            // 清理标题（移除 X/Twitter 未读消息数前缀）
+            data.cover = filterCover(url, data.cover);
+            // 非 status 的 X URL（profile/home）仍走 DOM 提取，document.title 可能带
+            // "(3) " 未读消息数前缀，需清洗。
             data.title = cleanTitle(url, data.title);
 
             return data;
