@@ -2,6 +2,7 @@
 
 import { uuidv4 } from '../utils/ids.js';
 import { findSchemaKey } from './schema.js';
+import { buildTagsForDatabase } from './tags.js';
 
 export async function createDatabasePageFromArticle(spaceId, collectionId, schema, articleData, userId, tags) {
     const pageId = uuidv4();
@@ -14,34 +15,8 @@ export async function createDatabasePageFromArticle(spaceId, collectionId, schem
     const tagsKey   = findSchemaKey(schema, ['Tags', '标签', 'Tag', 'Labels'], 'multi_select');
 
     // 处理 tags：仅在 tags 属性存在时写入，新增选项需更新 options
-    let finalTagsStr = null;
-    if (tagsKey && tags && tags.trim()) {
-        const inputTags = tags.split(/[,，]/).map(t => t.trim()).filter(Boolean);
-        const existingOptions = schema[tagsKey.key].options || [];
-        const existingValues = existingOptions.map(o => o.value);
-        const newOptions = [...existingOptions];
-        let hasNew = false;
-
-        for (const t of inputTags) {
-            if (!existingValues.includes(t)) {
-                newOptions.push({
-                    id: uuidv4(),
-                    value: t,
-                    color: ['default', 'gray', 'brown', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink', 'red'][Math.floor(Math.random() * 10)]
-                });
-                hasNew = true;
-            }
-        }
-
-        if (hasNew) {
-            operations.push({
-                id: collectionId, table: "collection",
-                path: ["schema", tagsKey.key], command: "update",
-                args: { name: tagsKey.name, type: tagsKey.type, options: newOptions }
-            });
-        }
-        if (inputTags.length > 0) finalTagsStr = inputTags.join(',');
-    }
+    const { finalTagsStr, schemaUpdateOp } = buildTagsForDatabase(tags, tagsKey, schema, collectionId);
+    if (schemaUpdateOp) operations.push(schemaUpdateOp);
 
     // 构建 properties（只写命中的属性）
     const authorLabel = articleData.authorName || articleData.siteName || '';
@@ -99,8 +74,10 @@ export async function createDatabasePageFromArticle(spaceId, collectionId, schem
         headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
         body: JSON.stringify({ requestId: uuidv4(), transactions: [{ id: uuidv4(), spaceId, operations }] })
     });
-    const resText = await res.text();
-    if (!res.ok) throw new Error("创建 Database 页面失败: " + resText.slice(0, 100));
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`创建 Database 页面失败 (HTTP ${res.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+    }
     return pageId;
 }
 
@@ -181,7 +158,9 @@ export async function createNotionPageFromArticle(spaceId, parentId, articleData
         headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
         body: JSON.stringify({ requestId: uuidv4(), transactions: [{ id: uuidv4(), spaceId, operations }] })
     });
-    const resText = await res.text();
-    if (!res.ok) throw new Error("创建页面失败: " + resText.slice(0, 100));
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`创建页面失败 (HTTP ${res.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+    }
     return pageId;
 }

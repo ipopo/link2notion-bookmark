@@ -2,10 +2,36 @@
 
 All notable changes to the **Notion 导入助手 (Notion Import Assistant)** project will be documented in this file.
 
+## [5.2.3] - 2026-04-27
+
+### Changed
+- **「批量书签」radio 合并为「书签 + 批量 toggle」**：从 4 个 radio 简化为 3 个（书签/文章/推特）；书签模式下右上区新增「批量」开关，与「封面」开关并排显示。批量状态独立持久化（`batch_enabled`），开关切换不再造成右上区宽度抖动。**老用户无感迁移**：旧 `import_style: 'batch'` 自动转为 `bookmark + batch_enabled: true`，pending_urls 草稿不丢。
+- **批量场景下封面图开关也可用**：原版本批量模式下封面 toggle 强制隐藏，本版按"每条 URL 抓到 og:image 就加封面图块、抓不到就跳过"处理（`importCoverEnabled` 不再依赖 `!isBatchMode`）。
+- **主题色改为护眼蓝绿**：所有衍生绿色从 `#87BD09` 系（黄绿）整体迁移到 `#50A550` 系（蓝绿）；按钮 hover 由 `#76A903` → `#468C46`，浅背景 `#fdfef9` → `#f4faf4`，进度条扫光亮绿 `#a8d62a` → `#7ac57a`。
+- **备注 / 标签 label 增加帮助 icon**：14×14 圆形 `?`，hover 显示 tooltip（CSS-only、可换行、最大 260px）。把"（选填）"等说明从永久可见的小字收纳进 tooltip，label 更干净。文章 / 推特模式 tooltip 文案如实反映写入规则（Database multi-select 自动新增缺失选项、普通页面前置在文章 / 推文顶部信息栏）。
+- **网页链接 textarea 改为固定 90px + 内部滚动**：禁用拖拽（`resize: none`），批量粘贴大量 URL 不再撑开布局，备注 / 导入按钮位置稳定。
+- **删除「*支持填充多个链接」批量提示文字**：批量模式下 textarea 高度增加 + 工具栏出现已是足够明显的视觉信号。
+
+### Fixed
+- **导入成功后备注未自动清空**：`completeProgress` 的 3 秒倒计时 +「在 Notion 中查看」按钮跳转会关闭 popup，导致 `await completeProgress(...)` 之后的 `caption.value = ""` / `chrome.storage.local.remove('pending_caption')` 永远跑不到，下次打开 popup 仍恢复旧备注。三处导入分支（文章 / 推特 / 书签批量）的清理时机都提前到 `await completeProgress` 之前。
+- **Notion API 错误响应体未读取**：`bookmark.js` 的 `createFullBookmark` / `createImageBlock` 仅判 `res.ok` 不读响应体，出错时用户只看到干瘪的"写入失败"。统一为 `(HTTP {status}): {body 200 字符}` 格式，覆盖 `bookmark.js` / `article-writer.js` / `tweet-writer.js` 6 处 saveTransactions 调用。
+- **`ui/tags.js` 用 `innerHTML = ''` 清空容器**：改为 `replaceChildren()`，避免 innerHTML 模式（即使当前赋值为空字符串相对安全，也属最佳实践改进）。
+- **`ui/init.js` `chrome.storage.local.get` 仍用回调**：改为 `await chrome.storage.local.get(...)`，规避潜在异步竞态。
+
+### Internal
+- **抽 `utils/fetch.js` 公共 `fetchWithTimeout`**：原 `extractors/remote.js` 与 `extractors/tweet-syndication.js` 各自实现的 `AbortController` + 8s 超时合并为单一工具，整个项目仅留 1 处 `AbortController` 实例。
+- **抽 `notion/tags.js` 公共 `buildTagsForDatabase`**：article-writer 与 tweet-writer 中近 30 行重复的「解析输入标签 → 比对 schema.options → 推送 schema 更新 op」逻辑合并到单函数。
+- **抽 `main-flow.js` 内部 `persistRemainingIfBatch` helper**：批量循环中两处 `pending_urls` 回写代码段合并；判断条件改为「书签 + 批量 toggle 开」（与 REFACTOR_LOG R8 一致：实时读 DOM 而非顶部锁定值）。
+- **`manifest.json` 增加 MV3 内容安全策略**：`"content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'" }`，为 popup / DOMParser 增加一层防御。
+- **`src/lib/Readability.js` 头部加来源说明**：标注 Mozilla 上游链接与升级方式（整体替换 release 版），便于后续维护。
+- **预览图（`screenshots/preview.png`）更新**：反映新版 UI（书签 + 批量/封面 toggle 并排、护眼蓝绿主题、? 帮助 icon）。
+
+---
+
 ## [5.2.2] - 2026-04-24
 
 ### Internal
-- **`popup.js` ESM 模块化重构**：将原 2100+ 行 monolithic `popup.js` 拆分为 20 个 ESM 模块，按职责分组到 `extractors/` `notion/` `parsers/` `ui/` `utils/` 五个目录；入口 `popup.js` 仅保留两行 `import`。重构遵循"行为零变更、模块边界清晰"原则，详见 `REFACTOR_LOG.md`。
+- **`popup.js` 全量 ESM 模块化重构**：将原 2100+ 行 monolithic `popup.js` 拆分为 20 个 ESM 模块（包含 v5.2.1 引入的 syndication 模块），按职责分组到 `extractors/` `notion/` `parsers/` `ui/` `utils/` 五个目录；入口 `popup.js` 仅保留两行 `import`。重构遵循"行为零变更、模块边界清晰"原则，详见 `REFACTOR_LOG.md`。
 - **syndication 抽为独立模块**：v5.2.1 的推文 syndication 抓取逻辑（`TWEET_STATUS_RE` / `_tweetMetaCache` / `fetchTweetMeta`）抽离到 `extractors/tweet-syndication.js`，与 `extractors/remote.js`、`extractors/current-tab.js` 解耦；功能与 v5.2.1 等价，仅结构变化。
 
 ---

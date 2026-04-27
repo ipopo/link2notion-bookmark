@@ -103,7 +103,7 @@ src/popup/
 
 - ✅ 25 个 import 全部对应存在的 export
 - ✅ 无残留的 `_importProgress` / `_progressBar` / `_progressText` / `getSpaceIdViaLoadChunk`
-- ✅ `_btnImport` / `_importForm` / `_status` / `_pendingDismiss` 仅在 main-flow.js 内使用
+- ✅ `_btnImport` / `_importForm` / `_status` / `_pendingDismiss` 均为 `main-flow.js` 模块内 `const/let`，不会外泄到全局作用域（ESM 隔离 + 文件内独占引用）
 - ✅ `popup.html` 仍是 `<script type="module" src="popup.js">`
 - ✅ 无重复的 export 名称（每个函数仅在一处定义）
 

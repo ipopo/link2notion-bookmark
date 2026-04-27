@@ -38,7 +38,7 @@ export function showTagSuggestions(title) {
         container.classList.add('hidden');
         return;
     }
-    container.innerHTML = '';
+    container.replaceChildren();
     tags.forEach(tag => {
         const chip = document.createElement('span');
         chip.className = 'tag-chip';
@@ -52,7 +52,7 @@ export function showTagSuggestions(title) {
 
 export function hideTagSuggestions() {
     const container = document.getElementById('tagSuggestions');
-    container.innerHTML = '';
+    container.replaceChildren();
     container.classList.add('hidden');
 }
 

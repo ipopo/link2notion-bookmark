@@ -27,10 +27,6 @@
                 <input type="radio" name="importStyle" value="tweet">
                 <span>推特</span>
             </label>
-            <label class="style-option">
-                <input type="radio" name="importStyle" value="batch">
-                <span>批量链接</span>
-            </label>
         </div>
 
         <div class="divider"></div>
@@ -38,19 +34,26 @@
         <div id="urlSection">
             <div class="section-header" id="urlSectionHeader">
                 <label id="urlLabel">网页链接</label>
-                <!-- 封面控制（书签模式） -->
-                <div id="coverControl" class="cover-control hidden">
-                    <span id="noCoverTip" class="no-cover-tip hidden">该网页无封面图</span>
-                    <span id="coverText">封面图:</span>
-                    <label class="switch">
-                        <input type="checkbox" id="toggleCover">
-                        <span class="slider"></span>
-                    </label>
+                <!-- 书签模式专属 toggle 组：批量 + 封面 -->
+                <div id="bookmarkToggles" class="bookmark-toggles hidden">
+                    <div class="toggle-group">
+                        <span class="toggle-text">批量:</span>
+                        <label class="switch">
+                            <input type="checkbox" id="toggleBatch">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div id="coverControl" class="cover-control">
+                        <span id="noCoverTip" class="no-cover-tip hidden">该网页无封面图</span>
+                        <span id="coverText">封面图:</span>
+                        <label class="switch">
+                            <input type="checkbox" id="toggleCover">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
                 </div>
                 <!-- 文章模式提示 -->
                 <span id="articleTip" class="header-tip hidden">*可先框选正文</span>
-                <!-- 批量提示（批量模式） -->
-                <span id="batchUrlTip" class="header-tip hidden">*支持填充多个链接</span>
             </div>
 
             <textarea id="urls"></textarea>
@@ -63,8 +66,10 @@
         </div>
 
         <div id="captionSection">
-            <label id="captionLabel">备注（选填）</label>
-            <div id="captionTip" class="tips">*填写后会显示在bookmark卡片下方</div>
+            <label id="captionLabel">
+                <span id="captionLabelText">备注</span>
+                <span id="captionInfo" class="info-icon hidden" data-tip="">?</span>
+            </label>
             <input type="text" id="caption">
             <div id="tagSuggestions" class="tag-suggestions hidden"></div>
         </div>

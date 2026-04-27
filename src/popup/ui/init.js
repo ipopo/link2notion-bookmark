@@ -1,5 +1,5 @@
 // popup DOMContentLoaded 初始化：恢复存储、模式 radio、封面检测、事件绑定
-// 局部函数（isRestrictedUrl、updateCoverUI、checkCurrentPageCover、updateUIState）
+// 局部函数（isRestrictedUrl、updateCoverUI、checkCurrentPageCover、renderBookmarkMode、updateUIState）
 // 依赖大量 DOM 和闭包状态（currentPageCover），保持在 handler 内部而不抽出去
 
 import { extractCurrentTabMetadata } from '../extractors/current-tab.js';
@@ -7,24 +7,48 @@ import { showTagSuggestions, hideTagSuggestions, updateTagChipStates } from './t
 
 document.addEventListener('DOMContentLoaded', async () => {
     // 1. 加载所有状态
-    const storageData = await chrome.storage.local.get(['notion_page_id', 'pending_urls', 'pending_caption', 'import_style', 'cover_enabled']);
+    const storageData = await chrome.storage.local.get([
+        'notion_page_id', 'pending_urls', 'pending_caption',
+        'import_style', 'cover_enabled', 'batch_enabled'
+    ]);
+
+    // 一次性迁移：旧版 'batch' radio 模式 → 书签模式 + 批量开
+    // （v5.2.2 之前 batch 是独立 radio，v5.2.3 起合并为「书签 + 批量 toggle」）
+    let migratedImportStyle = storageData.import_style;
+    let migratedBatchEnabled = storageData.batch_enabled;
+    if (migratedImportStyle === 'batch') {
+        migratedImportStyle = 'bookmark';
+        migratedBatchEnabled = true;
+        chrome.storage.local.set({ import_style: 'bookmark', batch_enabled: true });
+    }
 
     if (storageData.notion_page_id) document.getElementById('pageId').value = storageData.notion_page_id;
     if (storageData.pending_caption) document.getElementById('caption').value = storageData.pending_caption;
 
     const urlsInput = document.getElementById('urls');
     const urlSection = document.getElementById('urlSection');
+    const bookmarkToggles = document.getElementById('bookmarkToggles');
     const coverControl = document.getElementById('coverControl');
     const toggleCover = document.getElementById('toggleCover');
+    const toggleBatch = document.getElementById('toggleBatch');
     const noCoverTip = document.getElementById('noCoverTip');
     const coverText = document.getElementById('coverText');
-    const batchUrlTip = document.getElementById('batchUrlTip');
     const batchTools = document.getElementById('batchTools');
     const articleTip = document.getElementById('articleTip');
 
     const captionSection = document.getElementById('captionSection');
-    const captionLabel = document.getElementById('captionLabel');
-    const captionTip = document.getElementById('captionTip');
+    const captionLabelText = document.getElementById('captionLabelText');
+    const captionInfo = document.getElementById('captionInfo');
+
+    // 在 label 文字旁边显示/隐藏「?」帮助 icon，hover 触发 tooltip（CSS 实现）
+    const setCaptionInfo = (tip) => {
+        if (tip) {
+            captionInfo.dataset.tip = tip;
+            captionInfo.classList.remove('hidden');
+        } else {
+            captionInfo.classList.add('hidden');
+        }
+    };
 
     // 导入样式 Radios
     const styleRadios = document.querySelectorAll('input[name="importStyle"]');
@@ -84,18 +108,63 @@ document.addEventListener('DOMContentLoaded', async () => {
             toggleCover.disabled = true;
         } finally {
             const currentStyle = document.querySelector('input[name="importStyle"]:checked').value;
-            if (currentStyle === 'bookmark') {
+            if (currentStyle === 'bookmark' && !toggleBatch.checked) {
                 updateCoverUI();
             }
+        }
+    };
+
+    // === 书签模式渲染：根据 toggleBatch 切换单/批量子状态 ===
+    // 抽成独立函数，因为切换批量 toggle 时需要重新渲染（不重新选 radio）
+    // 设计：右上 toggle 区（批量 + 封面）在两种子状态下结构一致，避免切换时跳动；
+    //       仅 textarea 内容、批量工具栏、tooltip 文案随子状态切换。
+    const renderBookmarkMode = async () => {
+        const isBatch = toggleBatch.checked;
+
+        urlSection.classList.remove('hidden');
+        captionSection.classList.remove('hidden');
+        bookmarkToggles.classList.remove('hidden');
+        bookmarkToggles.style.display = 'flex';
+        coverControl.classList.remove('hidden');
+        coverControl.style.display = 'flex';
+
+        if (isBatch) {
+            // 批量子模式：textarea 多行可编辑；封面图按"能抓多少抓多少"，无需逐条预检
+            batchTools.classList.remove('hidden');
+            captionLabelText.innerText = "备注";
+            setCaptionInfo("选填项，填写后会作为文字说明填充在 bookmark 的卡片下方");
+
+            // 批量场景下封面 toggle 始终可用，去掉单链接的"该网页无封面图"提示
+            toggleCover.disabled = false;
+            noCoverTip.classList.add('hidden');
+            coverText.classList.remove('hidden');
+
+            const batchData = await chrome.storage.local.get(['pending_urls']);
+            urlsInput.value = batchData.pending_urls || "";
+            urlsInput.readOnly = false;
+        } else {
+            // 单链接子模式（与原 'bookmark' 行为一致）
+            batchTools.classList.add('hidden');
+            captionLabelText.innerText = "备注";
+            setCaptionInfo("选填项，填写后会作为文字说明填充在 bookmark 的卡片下方");
+
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tabs && tabs[0]) {
+                urlsInput.value = tabs[0].url;
+            }
+            urlsInput.readOnly = false;
+
+            await checkCurrentPageCover();
+            updateCoverUI();
         }
     };
 
     // === 辅助函数：更新 UI 状态 ===
     const updateUIState = async (style) => {
         // 先隐藏所有条件区域
+        bookmarkToggles.classList.add('hidden');
         coverControl.classList.add('hidden');
         articleTip.classList.add('hidden');
-        batchUrlTip.classList.add('hidden');
         batchTools.classList.add('hidden');
         hideTagSuggestions();
 
@@ -104,8 +173,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             urlSection.classList.remove('hidden');
             captionSection.classList.remove('hidden');
             articleTip.classList.remove('hidden');
-            captionLabel.innerText = "标签（选填）";
-            captionTip.classList.add('hidden');
+            captionLabelText.innerText = "标签";
+            setCaptionInfo("选填项，多个用「,」分隔。写入 Database 时填入 Tags / 标签 多选列（自动新增缺失选项）；普通页面则前置在文章顶部信息栏");
 
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tabs && tabs[0]) {
@@ -117,8 +186,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             // 推文页面模式
             urlSection.classList.remove('hidden');
             captionSection.classList.remove('hidden');
-            captionLabel.innerText = "标签（选填）";
-            captionTip.classList.add('hidden');
+            captionLabelText.innerText = "标签";
+            setCaptionInfo("选填项，多个用「,」分隔。写入 Database 时填入 Tags / 标签 多选列（自动新增缺失选项）；普通页面则前置在推文顶部信息栏");
 
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tabs && tabs[0]) {
@@ -126,38 +195,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showTagSuggestions(tabs[0].title);
             }
             urlsInput.readOnly = true;
-        } else if (style === 'batch') {
-            // 批量模式
-            urlSection.classList.remove('hidden');
-            captionSection.classList.remove('hidden');
-            batchUrlTip.classList.remove('hidden');
-            batchTools.classList.remove('hidden');
-            captionLabel.innerText = "备注（选填）";
-            captionTip.innerText = "*多个链接的情况下，备注会被覆盖";
-            captionTip.classList.remove('hidden');
-
-            chrome.storage.local.get(['pending_urls'], (res) => {
-                urlsInput.value = res.pending_urls || "";
-            });
-            urlsInput.readOnly = false;
         } else {
-            // 默认模式（书签）
-            urlSection.classList.remove('hidden');
-            captionSection.classList.remove('hidden');
-            coverControl.classList.remove('hidden');
-            coverControl.style.display = 'flex'; // override hidden properly
-            captionLabel.innerText = "备注（选填）";
-            captionTip.innerText = "*填写后会显示在bookmark卡片下方";
-            captionTip.classList.remove('hidden');
-
-            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (tabs && tabs[0]) {
-                urlsInput.value = tabs[0].url;
-            }
-            urlsInput.readOnly = false;
-
-            await checkCurrentPageCover();
-            updateCoverUI();
+            // 书签模式（含批量子状态）
+            await renderBookmarkMode();
         }
     };
 
@@ -176,8 +216,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         initialStyle = 'tweet';
     } else {
         // 非推特页面：尊重用户上次的选择（除了 tweet），默认文章模式
-        const saved = storageData.import_style;
-        initialStyle = (saved && saved !== 'tweet') ? saved : 'article';
+        initialStyle = (migratedImportStyle && migratedImportStyle !== 'tweet') ? migratedImportStyle : 'article';
     }
 
     let targetRadio = Array.from(styleRadios).find(r => r.value === initialStyle);
@@ -186,6 +225,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 恢复封面图开关状态（默认关闭）
     toggleCover.checked = !!storageData.cover_enabled;
+    // 恢复批量开关状态（默认关闭）
+    toggleBatch.checked = !!migratedBatchEnabled;
 
     await updateUIState(initialStyle);
 
@@ -208,6 +249,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateCoverUI();
     });
 
+    // 批量开关监听：持久化 + 重新渲染书签模式
+    toggleBatch.addEventListener('change', (e) => {
+        chrome.storage.local.set({ 'batch_enabled': e.target.checked });
+        renderBookmarkMode();
+    });
+
 
     // 输入同步 Storage
     const ids = ['urls', 'pageId', 'caption'];
@@ -216,7 +263,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (el) el.addEventListener('input', (e) => {
             if (id === 'urls') {
                 const currentStyle = document.querySelector('input[name="importStyle"]:checked').value;
-                if (currentStyle === 'batch') {
+                // 仅在「书签 + 批量开」时持久化 URL 列表（其他模式 URL 来自当前 tab，无需保存）
+                if (currentStyle === 'bookmark' && toggleBatch.checked) {
                     chrome.storage.local.set({ 'pending_urls': e.target.value });
                 }
             } else {
@@ -229,7 +277,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     });
 
-    // === 按钮功能：自动填充和清空 (仅在批量模式可见) ===
+    // === 按钮功能：自动填充和清空 (仅在批量子模式可见) ===
     const btnAutoFill = document.getElementById('btnAutoFill');
     const btnClear = document.getElementById('btnClear');
 
