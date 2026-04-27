@@ -39,7 +39,10 @@ export async function createFullBookmark(spaceId, parentId, meta, url, userId, c
         headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
         body: JSON.stringify({ "requestId": uuidv4(), "transactions": [{ "id": uuidv4(), "spaceId": spaceId, "operations": operations }] })
     });
-    if (!res.ok) throw new Error("写入失败");
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`写入失败 (HTTP ${res.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+    }
 }
 
 export async function createImageBlock(spaceId, parentId, imageUrl, userId) {
@@ -77,5 +80,8 @@ export async function createImageBlock(spaceId, parentId, imageUrl, userId) {
         headers: { "Content-Type": "application/json", "x-notion-active-user-header": userId },
         body: JSON.stringify({ "requestId": uuidv4(), "transactions": [{ "id": uuidv4(), "spaceId": spaceId, "operations": operations }] })
     });
-    if (!res.ok) throw new Error("图片导入失败");
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`图片导入失败 (HTTP ${res.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+    }
 }

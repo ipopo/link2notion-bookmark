@@ -26,10 +26,13 @@ document.getElementById('btnImport').addEventListener('click', async () => {
     const manualCaption = document.getElementById('caption').value.trim();
 
     const selectedStyle = document.querySelector('input[name="importStyle"]:checked').value;
-    const isBatchMode = selectedStyle === 'batch';
+    const isBookmarkMode = selectedStyle === 'bookmark';
     const isTweetMode = selectedStyle === 'tweet';
     const isArticleMode = selectedStyle === 'article';
-    const importCoverEnabled = !isBatchMode && !isTweetMode && !isArticleMode && document.getElementById('toggleCover').checked;
+    // 「批量」是书签模式下的子开关，由 toggleBatch 决定（v5.2.3 起从 radio 抽出）
+    const isBatchMode = isBookmarkMode && document.getElementById('toggleBatch').checked;
+    // 封面图在书签模式下生效；批量子模式按"每条 URL 能抓到 og:image 就加，没有就跳过"
+    const importCoverEnabled = isBookmarkMode && document.getElementById('toggleCover').checked;
 
     if (_pendingDismiss) { _pendingDismiss(); _pendingDismiss = null; }
     _status.innerText = "";
@@ -89,15 +92,19 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             const pageInfo = await getPageInfo(pageId, userId);
             const { spaceId, isDatabase, collectionId, schema } = pageInfo;
 
-            if (isDatabase && collectionId) {
-                const newPageId = await createDatabasePageFromArticle(spaceId, collectionId, schema, articleData, userId, manualCaption);
-                await completeProgress(`✅ 已导入文章至 Database`, getNotionUrl(newPageId));
-            } else {
-                const newPageId = await createNotionPageFromArticle(spaceId, pageId, articleData, userId, manualCaption);
-                await completeProgress(`✅ 已导入文章`, getNotionUrl(newPageId));
-            }
+            const newPageId = (isDatabase && collectionId)
+                ? await createDatabasePageFromArticle(spaceId, collectionId, schema, articleData, userId, manualCaption)
+                : await createNotionPageFromArticle(spaceId, pageId, articleData, userId, manualCaption);
+
+            // 写入成功后立即清备注：completeProgress 的 3s 倒计时 +「在 Notion 中查看」
+            // 跳转会关闭 popup，清理必须在 await 之前
             document.getElementById('caption').value = "";
             chrome.storage.local.remove('pending_caption');
+
+            await completeProgress(
+                (isDatabase && collectionId) ? `✅ 已导入文章至 Database` : `✅ 已导入文章`,
+                getNotionUrl(newPageId)
+            );
         } catch (err) {
             console.error(err);
             hideProgress();
@@ -141,15 +148,20 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             const pageInfo = await getPageInfo(pageId, userId);
             const { spaceId, isDatabase, collectionId, schema } = pageInfo;
 
-            if (isDatabase && collectionId) {
-                const newPageId = await createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, manualCaption);
-                await completeProgress(`✅ 已导入至 Database（${threadData.tweets.length} 条推文）`, getNotionUrl(newPageId));
-            } else {
-                const newPageId = await createNotionPageFromThread(spaceId, pageId, threadData, userId, manualCaption);
-                await completeProgress(`✅ 已导入 ${threadData.tweets.length} 条推文`, getNotionUrl(newPageId));
-            }
+            const newPageId = (isDatabase && collectionId)
+                ? await createDatabasePageFromThread(spaceId, collectionId, schema, threadData, userId, manualCaption)
+                : await createNotionPageFromThread(spaceId, pageId, threadData, userId, manualCaption);
+
+            // 同文章模式：在 completeProgress 跳转可能关闭 popup 之前先清备注
             document.getElementById('caption').value = "";
             chrome.storage.local.remove('pending_caption');
+
+            await completeProgress(
+                (isDatabase && collectionId)
+                    ? `✅ 已导入至 Database（${threadData.tweets.length} 条推文）`
+                    : `✅ 已导入 ${threadData.tweets.length} 条推文`,
+                getNotionUrl(newPageId)
+            );
         } catch (err) {
             console.error(err);
             hideProgress();
@@ -188,7 +200,7 @@ document.getElementById('btnImport').addEventListener('click', async () => {
         const { spaceId, isDatabase } = await getPageInfo(pageId, userId);
 
         if (isDatabase) {
-            const styleLabel = isBatchMode ? "批量链接" : "书签";
+            const styleLabel = isBatchMode ? "批量书签" : "书签";
             hideProgress();
             _status.innerText = `⚠️ ${styleLabel}样式与Database不兼容，导入无效`;
             _status.style.color = "orange";
@@ -216,6 +228,17 @@ document.getElementById('btnImport').addEventListener('click', async () => {
                 return step;
             } else {
                 return `[${successCount + failedUrls.length + 1}/${targets.length}] ${step}`;
+            }
+        };
+
+        // 把待办 URL 实时回写 storage —— 仅当用户当前仍处在「书签 + 批量」时
+        // （循环中允许中途切换 radio 或关掉批量 toggle 来取消持久化，
+        //  与 REFACTOR_LOG R8 一致：实时读 DOM 而非用顶部锁定值）
+        const persistRemainingIfBatch = (content) => {
+            const styleNow = document.querySelector('input[name="importStyle"]:checked').value;
+            const batchOn = document.getElementById('toggleBatch').checked;
+            if (styleNow === 'bookmark' && batchOn) {
+                chrome.storage.local.set({ 'pending_urls': content });
             }
         };
 
@@ -250,11 +273,7 @@ document.getElementById('btnImport').addEventListener('click', async () => {
                 const newContent = [...failedUrls, ...remaining].join('\n');
 
                 document.getElementById('urls').value = newContent;
-
-                const isBatchMode = document.querySelector('input[name="importStyle"]:checked').value === 'batch';
-                if (isBatchMode) {
-                    chrome.storage.local.set({ 'pending_urls': newContent });
-                }
+                persistRemainingIfBatch(newContent);
 
             } catch (e) {
                 console.error(e);
@@ -268,19 +287,14 @@ document.getElementById('btnImport').addEventListener('click', async () => {
                 const newContent = [...failedUrls, ...remaining].join('\n');
 
                 document.getElementById('urls').value = newContent;
-
-                const isBatchMode = document.querySelector('input[name="importStyle"]:checked').value === 'batch';
-                if (isBatchMode) {
-                    chrome.storage.local.set({ 'pending_urls': newContent });
-                }
+                persistRemainingIfBatch(newContent);
             }
 
             await new Promise(r => setTimeout(r, 800));
         }
 
-        await completeProgress(targets.length === 1 ? "✅ 导入完成" : `✅ 完成！导入 ${successCount} 个`, getNotionUrl(pageId));
-
         // 最终清理：如果全部成功（即没有失败的），清空
+        // 提到 await completeProgress 之前，避免「在 Notion 中查看」跳转关闭 popup 导致清理跑不到
         if (failedUrls.length === 0) {
             document.getElementById('urls').value = "";
             chrome.storage.local.remove('pending_urls');
@@ -289,6 +303,8 @@ document.getElementById('btnImport').addEventListener('click', async () => {
             document.getElementById('caption').value = "";
             chrome.storage.local.remove('pending_caption');
         }
+
+        await completeProgress(targets.length === 1 ? "✅ 导入完成" : `✅ 完成！导入 ${successCount} 个`, getNotionUrl(pageId));
 
     } catch (err) {
         console.error(err);

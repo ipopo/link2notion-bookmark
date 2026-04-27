@@ -4,6 +4,8 @@
 // （cdn.syndication.twimg.com），拿到真实作者、正文与媒体图。
 // 仅针对推文 /status/{id} 链接短路；X 主页 / profile 等非 status URL 仍走通用流程。
 
+import { fetchWithTimeout } from '../utils/fetch.js';
+
 export const TWEET_STATUS_RE = /^https?:\/\/(?:x|twitter|vxtwitter|fxtwitter)\.com\/[^/]+\/status\/(\d+)/i;
 
 // 会话级缓存：同一 statusId 在 popup 存活期间只请求一次 syndication
@@ -17,13 +19,9 @@ export async function fetchTweetMeta(url) {
 
     let meta = null;
     try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch(
-            `https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=a`,
-            { signal: controller.signal }
+        const res = await fetchWithTimeout(
+            `https://cdn.syndication.twimg.com/tweet-result?id=${statusId}&token=a`
         );
-        clearTimeout(timeoutId);
         if (res.ok) {
             const data = await res.json();
             const user = data.user || {};

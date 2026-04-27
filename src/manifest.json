@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Notion 导入助手",
-  "version": "5.2.2",
+  "version": "5.2.3",
   "description": "链接/文章/推文导入Notion，自动抓取内容、支持手动选择",
   "permissions": [
     "storage",
@@ -22,5 +22,8 @@
   },
   "icons": {
     "128": "assets/icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
   }
 }

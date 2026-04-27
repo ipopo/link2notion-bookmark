@@ -1,4 +1,8 @@
 /*
+ * Source: Mozilla Readability (https://github.com/mozilla/readability)
+ * Vendored copy used by 文章模式 提取正文。请勿手动修改本地版本，
+ * 升级时请整体替换为上游最新 release 的 `Readability.js`。
+ *
  * Copyright (c) 2010 Arc90 Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

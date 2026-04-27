@@ -1,6 +1,7 @@
-// 方案A：远程爬虫（用于批量链接模式，非当前标签页）
+// 方案A：远程爬虫（用于批量书签模式，非当前标签页）
 
 import { cleanTitle, filterCover } from '../utils/url.js';
+import { fetchWithTimeout } from '../utils/fetch.js';
 import { TWEET_STATUS_RE, fetchTweetMeta } from './tweet-syndication.js';
 
 export async function fetchRemoteMetadata(url) {
@@ -14,11 +15,7 @@ export async function fetchRemoteMetadata(url) {
 
     const result = { title: null, description: null, cover: null, icon: null };
     try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-
+        const res = await fetchWithTimeout(url);
         if (!res.ok) throw new Error("Fetch failed");
 
         const text = await res.text();
